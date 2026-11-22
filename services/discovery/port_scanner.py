@@ -1,4 +1,4 @@
-"""Concurrent TCP port scanner and RTSP endpoint protocol handshake verifier."""
+"""Scoped TCP port scanner and unauthenticated RTSP protocol service identifier."""
 
 from __future__ import annotations
 
@@ -11,7 +11,7 @@ from typing import Dict, List, Optional, Tuple
 
 from shared.logger import get_logger
 from shared.models import RTSPEndpoint
-from shared.security import expand_subnet_hosts, mask_rtsp_credentials
+from shared.security import expand_subnet_hosts, sanitize_uri_template
 
 logger = get_logger("discovery.port_scanner")
 
@@ -31,7 +31,7 @@ ONVIF_HTTP_PORTS = (80, 8000, 8080, 8899)
 
 @dataclass
 class HostScanResult:
-    """Discovered host with open CCTV/RTSP/ONVIF TCP ports and verified RTSP streams."""
+    """Discovered host candidate with open CCTV/RTSP/ONVIF TCP ports."""
 
     ip_address: str
     open_ports: List[int] = field(default_factory=list)
@@ -39,6 +39,7 @@ class HostScanResult:
     manufacturer_hint: str = "Generic"
     rtsp_endpoints: List[RTSPEndpoint] = field(default_factory=list)
     onvif_http_port: Optional[int] = None
+    rtsp_service_detected: bool = False
 
 
 def probe_tcp_port(ip_address: str, port: int, timeout_sec: float = 0.8) -> Tuple[bool, float]:
@@ -65,16 +66,15 @@ def verify_rtsp_endpoint(
     timeout_sec: float = 1.0,
 ) -> Tuple[bool, Optional[str], str]:
     """
-    Perform an RTSP OPTIONS/DESCRIBE protocol probe over TCP to confirm a valid RTSP service.
-
-    Returns:
-        (is_valid_rtsp, server_header, status_code_str)
+    Perform an RTSP OPTIONS protocol check over TCP.
+    During broad discovery, `username` and `password` MUST be None (unauthenticated identification).
+    Credentials may only be supplied during explicit single-device enrollment verification.
     """
     target_uri = f"rtsp://{ip_address}:{port}{path}"
     headers = [
         f"OPTIONS {target_uri} RTSP/1.0",
         "CSeq: 1",
-        "User-Agent: CCTV-Streamer-Discovery/1.0",
+        "User-Agent: CCTV-Streamer-Discovery/1.1",
     ]
     if username:
         raw_creds = f"{username}:{password or ''}".encode("utf-8")
@@ -108,27 +108,25 @@ def verify_rtsp_endpoint(
             server_header = line.split(":", 1)[1].strip()
             break
 
-    # 200 OK, 401 Unauthorized, or 454 Session Not Found all prove a live RTSP server
     is_valid = status_code in ("200", "401", "403", "454")
     return (is_valid, server_header, status_code)
 
 
 class NetworkPortScanner:
-    """High-concurrency network scanner for RTSP and ONVIF camera ports."""
+    """
+    Scoped, rate-limited network scanner for RTSP and ONVIF camera ports.
+    Strictly non-authenticating: never sends default or configured passwords during subnet scans.
+    """
 
     def __init__(
         self,
         ports: Optional[List[int]] = None,
         timeout_sec: float = 0.8,
         max_workers: int = 64,
-        rtsp_username: Optional[str] = None,
-        rtsp_password: Optional[str] = None,
     ) -> None:
         self.ports = ports or [554, 8554, 80, 8000, 8080, 8899]
         self.timeout_sec = timeout_sec
-        self.max_workers = max(1, min(256, max_workers))
-        self.rtsp_username = rtsp_username
-        self.rtsp_password = rtsp_password
+        self.max_workers = max(1, min(128, max_workers))
 
     def scan_subnets(
         self,
@@ -136,8 +134,10 @@ class NetworkPortScanner:
         verify_rtsp: bool = True,
         max_hosts_per_subnet: int = 1024,
     ) -> List[HostScanResult]:
-        """Scan all hosts in the given CIDR subnets for open camera ports and RTSP endpoints."""
-        hosts = expand_subnet_hosts(subnets, max_hosts_per_subnet=max_hosts_per_subnet)
+        """Scan hosts in approved private CIDR subnets for open camera ports (unauthenticated)."""
+        hosts = expand_subnet_hosts(
+            subnets, max_hosts_per_subnet=max_hosts_per_subnet, allow_public=False
+        )
         if not hosts:
             return []
 
@@ -177,7 +177,7 @@ class NetworkPortScanner:
             )
 
             if verify_rtsp:
-                self._discover_host_rtsp_endpoints(scan_res)
+                self._identify_host_rtsp_service_unauthenticated(scan_res)
             else:
                 for p in ports_only:
                     if p in RTSP_CANDIDATE_PORTS:
@@ -195,13 +195,17 @@ class NetworkPortScanner:
 
         return results
 
-    def _discover_host_rtsp_endpoints(self, host_result: HostScanResult) -> None:
-        """Probe open RTSP candidate ports on a discovered host for responsive RTSP streams."""
+    def _identify_host_rtsp_service_unauthenticated(
+        self, host_result: HostScanResult
+    ) -> None:
+        """
+        Issue unauthenticated RTSP OPTIONS probes to identify RTSP service banners.
+        Never sends credentials and never marks `verified=True` until explicit enrollment.
+        """
         candidate_ports = [
             p for p in host_result.open_ports if p in RTSP_CANDIDATE_PORTS
         ]
         if not candidate_ports and host_result.open_ports:
-            # If only HTTP/ONVIF ports were open, also synthesize standard port 554 entry
             host_result.rtsp_endpoints.append(
                 RTSPEndpoint(
                     url=f"rtsp://{host_result.ip_address}:554/stream1",
@@ -214,37 +218,39 @@ class NetworkPortScanner:
             return
 
         for port in candidate_ports:
-            verified_any = False
+            detected_any = False
             for path, vendor, profile in COMMON_RTSP_PATHS:
-                is_valid, server_hdr, status_code = verify_rtsp_endpoint(
+                is_rtsp, server_hdr, _ = verify_rtsp_endpoint(
                     ip_address=host_result.ip_address,
                     port=port,
                     path=path,
-                    username=self.rtsp_username,
-                    password=self.rtsp_password,
+                    username=None,
+                    password=None,
                     timeout_sec=self.timeout_sec,
                 )
-                if is_valid:
-                    verified_any = True
+                if is_rtsp:
+                    detected_any = True
+                    host_result.rtsp_service_detected = True
                     if server_hdr:
                         host_result.manufacturer_hint = server_hdr
                     elif host_result.manufacturer_hint == "Generic":
                         host_result.manufacturer_hint = vendor
-                    raw_url = f"rtsp://{host_result.ip_address}:{port}{path}"
+                    raw_url = sanitize_uri_template(
+                        f"rtsp://{host_result.ip_address}:{port}{path}"
+                    )
                     host_result.rtsp_endpoints.append(
                         RTSPEndpoint(
-                            url=mask_rtsp_credentials(raw_url),
+                            url=raw_url,
                             transport="tcp",
                             port=port,
                             path=path,
                             profile_token=profile,
-                            verified=(status_code == "200"),
+                            verified=False,  # Remains unverified until explicit enrollment
                         )
                     )
                     break
 
-            if not verified_any:
-                # Port is open via TCP handshake even if custom RTSP path wasn't matched
+            if not detected_any:
                 host_result.rtsp_endpoints.append(
                     RTSPEndpoint(
                         url=f"rtsp://{host_result.ip_address}:{port}/stream1",

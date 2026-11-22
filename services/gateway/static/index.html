@@ -3,8 +3,8 @@
 <head>
   <meta charset="UTF-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1.0" />
-  <title>CCTV-Streamer | Enterprise Surveillance &amp; RTSP Microservices Console</title>
-  <meta name="description" content="Enterprise self-hosted CCTV monitoring system with ONVIF camera discovery, OpenCV RTSP stream ingestion, and real-time video analytics." />
+  <title>CCTV-Streamer | Self-Hosted Surveillance &amp; Authorized IoT Platform</title>
+  <meta name="description" content="Self-hosted, local-first, multi-site CCTV and authorized IoT management platform with ONVIF Profile T discovery, MediaMTX WebRTC/HLS, and OpenCV analytics." />
   <link rel="preconnect" href="https://fonts.googleapis.com" />
   <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
   <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&family=JetBrains+Mono:wght@400;500;600&display=swap" rel="stylesheet" />
@@ -21,25 +21,26 @@
       </div>
       <div class="brand-title">
         <h1>CCTV-Streamer Operations Console</h1>
-        <div class="brand-subtitle">ONVIF Discovery &bull; OpenCV RTSP Transcoder &bull; Real-Time Analytics</div>
+        <div class="brand-subtitle">Scoped Discovery &bull; Vault Enrollment &bull; MediaMTX WebRTC/HLS &bull; OpenCV Analytics</div>
       </div>
     </div>
 
     <div class="service-strip" id="service-health-strip">
       <span class="service-pill" id="pill-discovery">
-        <span class="status-dot"></span> Discovery: ONLINE
+        <span class="status-dot"></span> Discovery: SCOPED
       </span>
       <span class="service-pill" id="pill-transcoder">
-        <span class="status-dot"></span> Transcoder: ONLINE
+        <span class="status-dot"></span> Media Plane: ONLINE
       </span>
       <span class="service-pill" id="pill-processor">
-        <span class="status-dot"></span> Analytics: ONLINE
+        <span class="status-dot"></span> Analytics: DURABLE
       </span>
     </div>
 
     <div class="topbar-actions">
-      <button type="button" class="btn" id="btn-open-add-stream">Add RTSP Stream</button>
-      <button type="button" class="btn btn-primary" id="btn-trigger-scan">Run ONVIF / Port Scan</button>
+      <button type="button" class="btn" id="btn-open-mobile-pair">Pair Android App</button>
+      <button type="button" class="btn" id="btn-open-add-stream">Enroll Stream</button>
+      <button type="button" class="btn btn-primary" id="btn-trigger-scan">Run Scoped Scan</button>
     </div>
   </header>
 
@@ -47,29 +48,29 @@
     <section aria-label="Live Surveillance Matrix">
       <div class="metrics-bar">
         <div class="metric-tile">
-          <div class="metric-label">Active RTSP Pipelines</div>
+          <div class="metric-label">Authorized Streams</div>
           <div class="metric-value" id="metric-active-streams">0</div>
-          <div class="metric-meta" id="metric-total-cameras">0 discovered endpoints</div>
+          <div class="metric-meta" id="metric-total-cameras">0 approved / 0 candidates</div>
         </div>
         <div class="metric-tile">
-          <div class="metric-label">Aggregate Frame Rate</div>
+          <div class="metric-label">Aggregate Throughput</div>
           <div class="metric-value" id="metric-aggregate-fps">0.0 FPS</div>
-          <div class="metric-meta" id="metric-aggregate-bitrate">0.0 kbps transcoded</div>
+          <div class="metric-meta" id="metric-aggregate-bitrate">0.0 kbps</div>
         </div>
         <div class="metric-tile">
-          <div class="metric-label">OpenCV Frames Analyzed</div>
+          <div class="metric-label">OpenCV Analytics</div>
           <div class="metric-value" id="metric-frames-analyzed">0</div>
-          <div class="metric-meta" id="metric-reconnections">0 stream reconnections</div>
+          <div class="metric-meta" id="metric-motion-events">0 motion &bull; 0 tamper</div>
         </div>
         <div class="metric-tile">
-          <div class="metric-label">Kinetic Motion Alerts</div>
-          <div class="metric-value" id="metric-motion-events">0</div>
-          <div class="metric-meta" id="metric-tamper-events">0 tamper alerts</div>
+          <div class="metric-label">Recording Storage</div>
+          <div class="metric-value" id="metric-storage-free">0.0 GB</div>
+          <div class="metric-meta" id="metric-storage-estimate">14d estimate: 0 GB</div>
         </div>
       </div>
 
       <div class="section-header">
-        <h2 class="section-title">Live OpenCV Transcoded Stream Matrix (MJPEG Low-Latency)</h2>
+        <h2 class="section-title">Authenticated Live Camera Matrix (Ticket-Scoped Delivery)</h2>
         <div class="layout-controls">
           <button type="button" class="btn btn-sm" id="btn-grid-2x2">2&times;2 Matrix</button>
           <button type="button" class="btn btn-sm" id="btn-grid-1x1">Single Focus</button>
@@ -79,15 +80,15 @@
       <div class="camera-grid" id="camera-matrix-grid"></div>
     </section>
 
-    <aside class="sidebar" aria-label="Discovery and Analytics Telemetry">
+    <aside class="sidebar" aria-label="Scoped Discovery, Candidate Approval, and Analytics">
       <div class="panel">
         <div class="panel-header">
-          <h2 class="panel-title">ONVIF &amp; Subnet Port Scanner</h2>
-          <span class="badge" id="scan-status-badge">READY</span>
+          <h2 class="panel-title">Approved Scope Discovery (Non-Authenticating)</h2>
+          <span class="badge" id="scan-status-badge">SCOPE READY</span>
         </div>
         <form id="discovery-scan-form" class="form-stack">
           <div class="field-group">
-            <label for="input-scan-subnets">Target IPv4 CIDR / Host IP</label>
+            <label for="input-scan-subnets">Approved Private CIDR Scope</label>
             <input
               type="text"
               id="input-scan-subnets"
@@ -97,7 +98,7 @@
             />
           </div>
           <div class="field-group">
-            <label for="input-scan-ports">RTSP &amp; ONVIF TCP Ports</label>
+            <label for="input-scan-ports">Allowed Diagnostic Ports</label>
             <input
               type="text"
               id="input-scan-ports"
@@ -106,7 +107,7 @@
             />
           </div>
           <button type="submit" class="btn btn-primary" id="btn-submit-scan">
-            Scan Network &amp; Verify RTSP
+            Scan Approved Scope (No Credential Guessing)
           </button>
         </form>
 
@@ -115,7 +116,7 @@
 
       <div class="panel">
         <div class="panel-header">
-          <h2 class="panel-title">OpenCV Analytics Event Log</h2>
+          <h2 class="panel-title">Durable Analytics Event Inbox</h2>
           <span class="badge" id="events-count-badge">0 EVENTS</span>
         </div>
         <div class="event-list" id="analytics-events-list"></div>
@@ -123,16 +124,16 @@
     </aside>
   </main>
 
-  <!-- Add Stream Modal -->
+  <!-- Enroll Stream Modal -->
   <div class="modal-backdrop" id="modal-add-stream" role="dialog" aria-modal="true" aria-labelledby="modal-add-stream-title">
     <div class="modal-box">
       <div class="panel-header">
-        <h2 class="panel-title" id="modal-add-stream-title">Register RTSP Camera Stream</h2>
+        <h2 class="panel-title" id="modal-add-stream-title">Enroll Approved Camera Stream</h2>
         <button type="button" class="btn btn-sm" id="btn-close-add-stream">Close</button>
       </div>
       <form id="form-register-stream" class="form-stack">
         <div class="field-group">
-          <label for="reg-camera-id">Camera Identifier</label>
+          <label for="reg-camera-id">Device / Camera ID</label>
           <input type="text" id="reg-camera-id" class="input-text" placeholder="cam-east-wing" required />
         </div>
         <div class="field-group">
@@ -140,17 +141,40 @@
           <input type="text" id="reg-camera-name" class="input-text" placeholder="East Wing Entrance" required />
         </div>
         <div class="field-group">
-          <label for="reg-camera-location">Facility Zone</label>
+          <label for="reg-camera-location">Site / Facility Zone</label>
           <input type="text" id="reg-camera-location" class="input-text" value="Sector B" required />
         </div>
         <div class="field-group">
-          <label for="reg-rtsp-url">RTSP Endpoint URI (or demo://name)</label>
+          <label for="reg-rtsp-url">Authorized RTSP / ONVIF URI</label>
           <input type="text" id="reg-rtsp-url" class="input-text" placeholder="rtsp://192.168.1.50:554/Streaming/Channels/101" required />
         </div>
         <button type="submit" class="btn btn-primary" id="btn-submit-register-stream">
-          Start OpenCV Ingestion Pipeline
+          Enroll &amp; Start Authenticated Stream
         </button>
       </form>
+    </div>
+  </div>
+
+  <!-- Mobile App Pairing Modal -->
+  <div class="modal-backdrop" id="modal-mobile-pair" role="dialog" aria-modal="true" aria-labelledby="modal-mobile-pair-title">
+    <div class="modal-box">
+      <div class="panel-header">
+        <h2 class="panel-title" id="modal-mobile-pair-title">Pair Flutter Android Mobile App</h2>
+        <button type="button" class="btn btn-sm" id="btn-close-mobile-pair">Close</button>
+      </div>
+      <div class="form-stack">
+        <p class="camera-meta-sub">
+          Generate a short-lived pairing code for the CCTV-Streamer Android client. Camera credentials remain encrypted on this server and are never stored on the mobile device.
+        </p>
+        <div class="metric-tile">
+          <div class="metric-label">One-Time Pairing Code (5 min TTL)</div>
+          <div class="metric-value" id="mobile-pairing-code-display">CLICK GENERATE</div>
+          <div class="metric-meta" id="mobile-pairing-qr-payload"></div>
+        </div>
+        <button type="button" class="btn btn-primary" id="btn-generate-pairing-code">
+          Generate New Pairing Code
+        </button>
+      </div>
     </div>
   </div>
 

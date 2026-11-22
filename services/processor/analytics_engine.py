@@ -1,17 +1,21 @@
-"""OpenCV real-time video frame analytics: motion detection, bounding boxes, and tamper analysis."""
+"""OpenCV real-time video frame analytics with detection zones, privacy masks, and durable DB persistence."""
 
 from __future__ import annotations
 
 import collections
+import json
 import threading
 import time
 import uuid
 from dataclasses import dataclass, field
-from typing import Any, Deque, Dict, List, Optional, Tuple
+from typing import Any, Deque, Dict, List, Optional
 
 import cv2
 import numpy as np
 
+from services.processor.zones import ZoneRect, apply_privacy_masks, match_detection_zone
+from shared.audit import record_audit_event
+from shared.database import DatabaseManager, get_db
 from shared.logger import get_logger
 from shared.models import AnalyticsEvent, EventSeverity, EventType, utc_now_iso
 
@@ -20,15 +24,17 @@ logger = get_logger("processor.analytics")
 
 @dataclass
 class CameraAnalyticsConfig:
-    """Per-camera tunable analytics parameters."""
+    """Per-camera tunable analytics parameters and detection/privacy zones."""
 
     camera_id: str
     motion_sensitivity_threshold: float = 500.0
     motion_min_contour_area: int = 450
     tamper_darkness_threshold: float = 18.0
     tamper_variance_threshold: float = 5.0
+    scene_change_threshold: float = 42000.0
     event_cooldown_sec: float = 5.0
     enabled: bool = True
+    zones: List[ZoneRect] = field(default_factory=list)
 
 
 @dataclass
@@ -71,8 +77,9 @@ class VideoAnalyticsEngine:
     """
     Thread-safe OpenCV video data processing engine providing:
     - Gaussian-smoothed inter-frame differential motion detection & contour bounding boxes
-    - Lens obstruction / darkness / low-variance tamper detection
-    - Cooldown-based event deduplication and telemetry aggregation
+    - User-defined detection zones and privacy mask zones
+    - Lens obstruction / darkness / low-variance tamper & scene-change detection
+    - Cooldown-based event deduplication and durable SQLite/PostgreSQL event persistence
     """
 
     def __init__(
@@ -83,12 +90,14 @@ class VideoAnalyticsEngine:
         default_tamper_variance: float = 5.0,
         default_cooldown_sec: float = 5.0,
         max_stored_events: int = 1000,
+        db: Optional[DatabaseManager] = None,
     ) -> None:
         self.default_motion_threshold = default_motion_threshold
         self.default_min_contour_area = default_min_contour_area
         self.default_tamper_darkness = default_tamper_darkness
         self.default_tamper_variance = default_tamper_variance
         self.default_cooldown_sec = default_cooldown_sec
+        self.db = db or get_db()
 
         self._lock = threading.RLock()
         self._configs: Dict[str, CameraAnalyticsConfig] = {}
@@ -119,6 +128,7 @@ class VideoAnalyticsEngine:
         tamper_variance_threshold: Optional[float] = None,
         event_cooldown_sec: Optional[float] = None,
         enabled: Optional[bool] = None,
+        zones: Optional[List[Dict[str, Any]]] = None,
     ) -> CameraAnalyticsConfig:
         with self._lock:
             cfg = self.get_or_create_config(camera_id)
@@ -134,7 +144,51 @@ class VideoAnalyticsEngine:
                 cfg.event_cooldown_sec = event_cooldown_sec
             if enabled is not None:
                 cfg.enabled = enabled
+            if zones is not None:
+                cfg.zones = [
+                    ZoneRect(
+                        name=z.get("name", "zone"),
+                        x1=float(z.get("x1", 0.0)),
+                        y1=float(z.get("y1", 0.0)),
+                        x2=float(z.get("x2", 1.0)),
+                        y2=float(z.get("y2", 1.0)),
+                        is_privacy_mask=bool(z.get("is_privacy_mask", False)),
+                    )
+                    for z in zones
+                ]
             return cfg
+
+    def _persist_event(self, evt: AnalyticsEvent) -> None:
+        """Persist AnalyticsEvent to durable SQLite/PostgreSQL storage and in-memory buffer."""
+        self._events.appendleft(evt)
+        try:
+            self.db.execute(
+                """
+                INSERT INTO analytics_events (
+                    event_id, device_id, site_id, camera_name, event_type,
+                    severity, score, zone_name, description, snapshot_ref,
+                    bounding_boxes_json, metadata_json, acknowledged, timestamp
+                )
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 0, ?)
+                """,
+                (
+                    evt.event_id,
+                    evt.camera_id,
+                    evt.site_id,
+                    evt.camera_name,
+                    evt.event_type.value,
+                    evt.severity.value,
+                    evt.score,
+                    evt.zone_name,
+                    evt.description,
+                    evt.snapshot_ref,
+                    json.dumps(evt.bounding_boxes),
+                    json.dumps(evt.metadata),
+                    evt.timestamp,
+                ),
+            )
+        except Exception as exc:
+            logger.debug("Event persistence fallback: %s", exc)
 
     def process_jpeg_bytes(
         self,
@@ -159,7 +213,7 @@ class VideoAnalyticsEngine:
         frame: np.ndarray,
         camera_name: Optional[str] = None,
     ) -> FrameAnalysisOutput:
-        """Run OpenCV motion and tamper analysis on a single BGR frame."""
+        """Run OpenCV motion, zone, scene-change, and tamper analysis on a single BGR frame."""
         if frame is None or frame.size == 0:
             raise ValueError("Frame cannot be empty")
 
@@ -167,17 +221,19 @@ class VideoAnalyticsEngine:
         label = camera_name or camera_id
         cfg = self.get_or_create_config(camera_id)
 
-        # Normalize analysis resolution to 640x360 for consistent contour area metrics
+        masked_frame = apply_privacy_masks(frame, cfg.zones)
+
         analysis_w, analysis_h = 640, 360
-        orig_h, orig_w = frame.shape[:2]
-        resized = cv2.resize(frame, (analysis_w, analysis_h), interpolation=cv2.INTER_AREA)
+        orig_h, orig_w = masked_frame.shape[:2]
+        resized = cv2.resize(
+            masked_frame, (analysis_w, analysis_h), interpolation=cv2.INTER_AREA
+        )
 
         # Crop out top 28px OSD timestamp bar so ticking clock digits do not trigger motion
         roi = resized[28:, :]
         gray = cv2.cvtColor(roi, cv2.COLOR_BGR2GRAY)
         blurred = cv2.GaussianBlur(gray, (15, 15), 0)
 
-        # Compute luminance and pixel variance for tamper/blackout detection
         mean_arr, std_arr = cv2.meanStdDev(gray)
         mean_lum = float(mean_arr[0][0])
         std_dev = float(std_arr[0][0])
@@ -193,6 +249,7 @@ class VideoAnalyticsEngine:
         bounding_boxes: List[Dict[str, int]] = []
         motion_score = 0.0
         motion_detected = False
+        matched_zone = "full_frame"
         emitted_events: List[AnalyticsEvent] = []
 
         with self._lock:
@@ -202,7 +259,11 @@ class VideoAnalyticsEngine:
                 self._states[camera_id] = state
             state.camera_name = label
 
-            if state.prev_gray is not None and state.prev_gray.shape == blurred.shape and cfg.enabled:
+            if (
+                state.prev_gray is not None
+                and state.prev_gray.shape == blurred.shape
+                and cfg.enabled
+            ):
                 frame_delta = cv2.absdiff(state.prev_gray, blurred)
                 _, thresh = cv2.threshold(frame_delta, 22, 255, cv2.THRESH_BINARY)
                 dilated = cv2.dilate(thresh, None, iterations=2)
@@ -215,17 +276,22 @@ class VideoAnalyticsEngine:
                     area = float(cv2.contourArea(contour))
                     if area < cfg.motion_min_contour_area:
                         continue
-                    total_area += area
                     x, y, w, h = cv2.boundingRect(contour)
-                    bounding_boxes.append(
-                        {
-                            "x": int(round(x * scale_x)),
-                            "y": int(round((y + 28) * scale_y)),
-                            "width": int(round(w * scale_x)),
-                            "height": int(round(h * scale_y)),
-                            "area": int(round(area)),
-                        }
+                    box = {
+                        "x": int(round(x * scale_x)),
+                        "y": int(round((y + 28) * scale_y)),
+                        "width": int(round(w * scale_x)),
+                        "height": int(round(h * scale_y)),
+                        "area": int(round(area)),
+                    }
+                    zone_label = match_detection_zone(
+                        box, orig_w, orig_h, cfg.zones
                     )
+                    if zone_label == "outside_zone":
+                        continue
+                    matched_zone = zone_label
+                    total_area += area
+                    bounding_boxes.append(box)
 
                 motion_score = round(total_area, 2)
                 motion_detected = (
@@ -233,7 +299,6 @@ class VideoAnalyticsEngine:
                     and len(bounding_boxes) > 0
                 )
 
-            # Blend current frame into reference background (exponential moving average)
             if state.prev_gray is None or state.prev_gray.shape != blurred.shape:
                 state.prev_gray = blurred
             else:
@@ -266,17 +331,19 @@ class VideoAnalyticsEngine:
                         else EventSeverity.CRITICAL
                     ),
                     score=motion_score,
+                    zone_name=matched_zone,
                     description=(
-                        f"Kinetic activity detected in {label} "
+                        f"Kinetic activity detected in {label} [{matched_zone}] "
                         f"({len(bounding_boxes)} region(s), score={motion_score:.0f})"
                     ),
+                    snapshot_ref=f"/api/v1/streams/{camera_id}/snapshot",
                     bounding_boxes=bounding_boxes,
                     metadata={
                         "luminance": round(mean_lum, 1),
                         "processing_ms": elapsed_ms,
                     },
                 )
-                self._events.appendleft(evt)
+                self._persist_event(evt)
                 emitted_events.append(evt)
 
             if tamper_detected and self._can_emit(
@@ -290,6 +357,7 @@ class VideoAnalyticsEngine:
                     event_type=EventType.TAMPER_OBSTRUCTION,
                     severity=EventSeverity.CRITICAL,
                     score=round(mean_lum, 2),
+                    zone_name="full_frame",
                     description=(
                         f"Potential lens obstruction or signal blackout on {label} "
                         f"(luminance={mean_lum:.1f}, variance={std_dev:.1f})"
@@ -300,7 +368,7 @@ class VideoAnalyticsEngine:
                         "std_dev": round(std_dev, 1),
                     },
                 )
-                self._events.appendleft(evt)
+                self._persist_event(evt)
                 emitted_events.append(evt)
 
         return FrameAnalysisOutput(
@@ -336,6 +404,45 @@ class VideoAnalyticsEngine:
         severity: Optional[EventSeverity] = None,
         limit: int = 50,
     ) -> List[AnalyticsEvent]:
+        """Query durable events from SQLite/PostgreSQL with fallback to memory."""
+        query = "SELECT * FROM analytics_events WHERE 1=1"
+        params: List[Any] = []
+        if camera_id:
+            query += " AND device_id = ?"
+            params.append(camera_id)
+        if event_type:
+            query += " AND event_type = ?"
+            params.append(event_type.value)
+        if severity:
+            query += " AND severity = ?"
+            params.append(severity.value)
+        query += " ORDER BY timestamp DESC LIMIT ?"
+        params.append(max(1, min(500, limit)))
+
+        rows = self.db.fetchall(query, tuple(params))
+        if rows:
+            return [
+                AnalyticsEvent(
+                    event_id=r["event_id"],
+                    camera_id=r["device_id"],
+                    site_id=r.get("site_id", "site-default"),
+                    camera_name=r["camera_name"],
+                    event_type=EventType(r["event_type"]),
+                    severity=EventSeverity(r["severity"]),
+                    timestamp=r["timestamp"],
+                    score=float(r.get("score", 0.0)),
+                    zone_name=r.get("zone_name", "full_frame"),
+                    description=r["description"],
+                    snapshot_ref=r.get("snapshot_ref"),
+                    acknowledged=bool(r.get("acknowledged", 0)),
+                    acknowledged_by=r.get("acknowledged_by"),
+                    acknowledged_at=r.get("acknowledged_at"),
+                    bounding_boxes=json.loads(r.get("bounding_boxes_json", "[]") or "[]"),
+                    metadata=json.loads(r.get("metadata_json", "{}") or "{}"),
+                )
+                for r in rows
+            ]
+
         with self._lock:
             items = list(self._events)
         if camera_id:
@@ -345,6 +452,35 @@ class VideoAnalyticsEngine:
         if severity:
             items = [e for e in items if e.severity == severity]
         return items[: max(1, min(500, limit))]
+
+    def acknowledge_event(
+        self, event_id: str, actor: str = "operator"
+    ) -> Optional[AnalyticsEvent]:
+        now = utc_now_iso()
+        self.db.execute(
+            """
+            UPDATE analytics_events
+            SET acknowledged = 1, acknowledged_by = ?, acknowledged_at = ?
+            WHERE event_id = ?
+            """,
+            (actor, now, event_id),
+        )
+        with self._lock:
+            for e in self._events:
+                if e.event_id == event_id:
+                    e.acknowledged = True
+                    e.acknowledged_by = actor
+                    e.acknowledged_at = now
+        record_audit_event(
+            action="ANALYTICS_EVENT_ACKNOWLEDGED",
+            target_type="EVENT",
+            target_id=event_id,
+            actor=actor,
+            actor_role="OPERATOR",
+            db=self.db,
+        )
+        matches = [e for e in self.list_events(limit=200) if e.event_id == event_id]
+        return matches[0] if matches else None
 
     def get_metrics_summary(self) -> Dict[str, Any]:
         with self._lock:

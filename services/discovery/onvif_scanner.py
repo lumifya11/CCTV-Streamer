@@ -1,4 +1,4 @@
-"""ONVIF WS-Discovery multicast scanner and SOAP Media profile RTSP resolver."""
+"""ONVIF WS-Discovery multicast scanner and explicit SOAP Media profile RTSP resolver."""
 
 from __future__ import annotations
 
@@ -8,6 +8,7 @@ import os
 import re
 import socket
 import time
+import urllib.error
 import urllib.parse
 import urllib.request
 import uuid
@@ -18,9 +19,11 @@ from typing import Dict, List, Optional, Tuple
 
 from shared.logger import get_logger
 from shared.models import RTSPEndpoint
-from shared.security import mask_rtsp_credentials
+from shared.security import mask_rtsp_credentials, sanitize_uri_template, validate_onvif_xaddr
 
 logger = get_logger("discovery.onvif")
+
+MAX_SOAP_RESPONSE_BYTES = 262_144  # 256 KB cap against oversized XML responses
 
 WS_DISCOVERY_PROBE_TEMPLATE = """<?xml version="1.0" encoding="UTF-8"?>
 <e:Envelope xmlns:e="http://www.w3.org/2003/05/soap-envelope"
@@ -40,9 +43,22 @@ WS_DISCOVERY_PROBE_TEMPLATE = """<?xml version="1.0" encoding="UTF-8"?>
 </e:Envelope>"""
 
 
+class _NoRedirectHandler(urllib.request.HTTPRedirectHandler):
+    """Block all HTTP redirects during ONVIF SOAP requests to prevent SSRF via redirect."""
+
+    def redirect_request(self, req, fp, code, msg, headers, newurl):
+        raise urllib.error.HTTPError(
+            req.full_url,
+            code,
+            "HTTP redirects are prohibited for ONVIF XAddr SOAP probes.",
+            headers,
+            fp,
+        )
+
+
 @dataclass
 class OnvifProbeDevice:
-    """Intermediate representation of an ONVIF camera discovered via WS-Discovery."""
+    """Intermediate representation of an ONVIF camera candidate discovered via WS-Discovery."""
 
     ip_address: str
     xaddr: str
@@ -52,6 +68,8 @@ class OnvifProbeDevice:
     manufacturer: str = "ONVIF Camera"
     model: str = "NetworkVideoTransmitter"
     location: str = "Main Facility"
+    onvif_profiles: List[str] = field(default_factory=lambda: ["Profile_T"])
+    legacy_profile_s: bool = False
     firmware_version: Optional[str] = None
     serial_number: Optional[str] = None
     rtsp_endpoints: List[RTSPEndpoint] = field(default_factory=list)
@@ -66,7 +84,7 @@ def build_ws_discovery_probe(message_id: Optional[str] = None) -> bytes:
 
 
 def build_wsse_security_header(username: str, password: str) -> str:
-    """Create an ONVIF WS-UsernameToken PasswordDigest SOAP header."""
+    """Create an ONVIF WS-UsernameToken PasswordDigest SOAP header (used only during explicit enrollment)."""
     nonce_bytes = os.urandom(16)
     created = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%S.000Z")
     digest_input = nonce_bytes + created.encode("utf-8") + password.encode("utf-8")
@@ -85,11 +103,14 @@ def build_wsse_security_header(username: str, password: str) -> str:
     </Security>"""
 
 
-def _extract_scope_Metadata(scopes: List[str]) -> Tuple[str, str, str]:
-    """Parse ONVIF scope URIs for manufacturer/name, hardware model, and location."""
+def _extract_scope_metadata(scopes: List[str]) -> Tuple[str, str, str, List[str], bool]:
+    """Parse ONVIF scope URIs for manufacturer, hardware model, location, and Profile T/S support."""
     manufacturer = "ONVIF"
     model = "Network Camera"
     location = "Sector A"
+    profiles: List[str] = []
+    has_profile_t = False
+    has_profile_s = False
 
     for scope in scopes:
         decoded = urllib.parse.unquote(scope)
@@ -106,16 +127,34 @@ def _extract_scope_Metadata(scopes: List[str]) -> Tuple[str, str, str]:
             val = decoded.split("/location/", 1)[-1].strip("/")
             if val:
                 location = val.replace("_", " ")
-    return manufacturer, model, location
+        elif "onvif://www.onvif.org/profile/" in lower:
+            prof = decoded.split("/profile/", 1)[-1].strip("/").upper()
+            if prof == "T":
+                has_profile_t = True
+                profiles.append("Profile_T")
+            elif prof == "S":
+                has_profile_s = True
+                profiles.append("Profile_S_Legacy")
+            elif prof in ("G", "M"):
+                profiles.append(f"Profile_{prof}")
+
+    if not profiles:
+        profiles = ["Profile_T"]
+    legacy_only = has_profile_s and not has_profile_t
+    return manufacturer, model, location, profiles, legacy_only
 
 
 def parse_ws_discovery_response(
     xml_bytes: bytes, sender_ip: Optional[str] = None, elapsed_ms: float = 0.0
 ) -> Optional[OnvifProbeDevice]:
     """Parse a WS-Discovery ProbeMatches SOAP response into an OnvifProbeDevice."""
-    if not xml_bytes or b"<!DOCTYPE" in xml_bytes or b"<!ENTITY" in xml_bytes:
-        # Reject XML payloads with DTD/Entity declarations to prevent XXE attacks
-        logger.warning("Rejected WS-Discovery response containing DTD/ENTITY declaration")
+    if (
+        not xml_bytes
+        or len(xml_bytes) > MAX_SOAP_RESPONSE_BYTES
+        or b"<!DOCTYPE" in xml_bytes
+        or b"<!ENTITY" in xml_bytes
+    ):
+        logger.warning("Rejected WS-Discovery response (oversized or contains DTD/ENTITY)")
         return None
 
     try:
@@ -143,15 +182,32 @@ def parse_ws_discovery_response(
     if not xaddrs_text and not sender_ip:
         return None
 
-    first_xaddr = xaddrs_text.split()[0] if xaddrs_text else f"http://{sender_ip}/onvif/device_service"
+    first_xaddr = (
+        xaddrs_text.split()[0]
+        if xaddrs_text
+        else f"http://{sender_ip}/onvif/device_service"
+    )
     parsed_url = urllib.parse.urlparse(first_xaddr)
     ip_address = parsed_url.hostname or sender_ip or ""
     if not ip_address:
         return None
 
-    scopes_list = [s for s in scopes_text.split() if s]
-    manufacturer, model, location = _extract_scope_Metadata(scopes_list)
+    # If sender_ip is known, ensure XAddr host matches sender_ip to prevent spoofed SSRF targets
+    if sender_ip and ip_address != sender_ip:
+        logger.warning(
+            "ONVIF XAddr host %s differed from UDP sender %s; pinning to sender IP",
+            ip_address,
+            sender_ip,
+        )
+        ip_address = sender_ip
+        first_xaddr = f"http://{sender_ip}:{parsed_url.port or 80}{parsed_url.path or '/onvif/device_service'}"
 
+    scopes_list = [s for s in scopes_text.split() if s]
+    manufacturer, model, location, profiles, legacy_s = _extract_scope_metadata(
+        scopes_list
+    )
+
+    candidate_url = f"rtsp://{ip_address}:554/Streaming/Channels/101"
     return OnvifProbeDevice(
         ip_address=ip_address,
         xaddr=first_xaddr,
@@ -161,19 +217,35 @@ def parse_ws_discovery_response(
         manufacturer=manufacturer,
         model=model,
         location=location,
+        onvif_profiles=profiles,
+        legacy_profile_s=legacy_s,
+        rtsp_endpoints=[
+            RTSPEndpoint(
+                url=candidate_url,
+                transport="tcp",
+                port=554,
+                path="/Streaming/Channels/101",
+                profile_token="Profile_1",
+                onvif_profile=profiles[0],
+                verified=False,
+            )
+        ],
         response_time_ms=round(elapsed_ms, 2),
     )
 
 
 class OnvifScanner:
-    """Performs WS-Discovery multicast scans and ONVIF SOAP RTSP stream URI extraction."""
+    """
+    Performs non-authenticating WS-Discovery multicast scans during discovery,
+    and explicit authenticated SOAP stream URI extraction only during enrollment.
+    """
 
     def __init__(
         self,
         multicast_host: str = "239.255.255.250",
         multicast_port: int = 3702,
         timeout_sec: float = 2.0,
-        username: str = "admin",
+        username: str = "",
         password: str = "",
     ) -> None:
         self.multicast_host = multicast_host
@@ -182,8 +254,11 @@ class OnvifScanner:
         self.username = username
         self.password = password
 
-    def discover_multicast(self) -> List[OnvifProbeDevice]:
-        """Broadcast WS-Discovery UDP Probe and collect ONVIF camera responses."""
+    def discover_multicast(self, enrich_via_soap: bool = False) -> List[OnvifProbeDevice]:
+        """
+        Broadcast WS-Discovery UDP Probe and collect ONVIF camera candidate responses.
+        By default (`enrich_via_soap=False`), performs strictly non-authenticating discovery.
+        """
         discovered: Dict[str, OnvifProbeDevice] = {}
         probe_payload = build_ws_discovery_probe()
         start_time = time.monotonic()
@@ -224,11 +299,11 @@ class OnvifScanner:
                     data, sender_ip=sender_ip, elapsed_ms=elapsed_ms
                 )
                 if device and device.ip_address not in discovered:
-                    # Query SOAP stream URI if possible
-                    self.enrich_device_via_soap(device)
+                    if enrich_via_soap and self.username:
+                        self.enrich_device_via_soap(device)
                     discovered[device.ip_address] = device
                     logger.info(
-                        "Discovered ONVIF device at %s (%s %s) in %.1f ms",
+                        "Discovered ONVIF candidate at %s (%s %s) in %.1f ms",
                         device.ip_address,
                         device.manufacturer,
                         device.model,
@@ -244,8 +319,23 @@ class OnvifScanner:
         device: OnvifProbeDevice,
         username: Optional[str] = None,
         password: Optional[str] = None,
+        approved_cidrs: Optional[List[str]] = None,
     ) -> None:
-        """Attempt ONVIF GetProfiles / GetStreamUri SOAP calls to resolve RTSP endpoints."""
+        """
+        Explicit enrollment-time ONVIF GetStreamUri SOAP query.
+        Validates XAddr against SSRF rules, blocks redirects, and caps payload size.
+        """
+        try:
+            validate_onvif_xaddr(
+                device.xaddr,
+                expected_device_ip=device.ip_address,
+                approved_cidrs=approved_cidrs,
+                allow_loopback=True,
+            )
+        except ValueError as exc:
+            logger.warning("Blocked unsafe ONVIF XAddr %s: %s", device.xaddr, exc)
+            return
+
         user = username if username is not None else self.username
         pwd = password if password is not None else self.password
         security_block = build_wsse_security_header(user, pwd) if user else ""
@@ -269,54 +359,53 @@ class OnvifScanner:
 </s:Envelope>"""
 
         try:
+            opener = urllib.request.build_opener(_NoRedirectHandler())
             req = urllib.request.Request(
                 device.xaddr,
                 data=get_stream_body.encode("utf-8"),
                 headers={
                     "Content-Type": "application/soap+xml; charset=utf-8",
-                    "User-Agent": "CCTV-Streamer-ONVIF/1.0",
+                    "User-Agent": "CCTV-Streamer-ONVIF/1.1",
                 },
                 method="POST",
             )
-            with urllib.request.urlopen(req, timeout=1.2) as resp:
-                raw_xml = resp.read()
-                rtsp_uri = self._extract_uri_from_soap(raw_xml)
-                if rtsp_uri:
-                    parsed = urllib.parse.urlparse(rtsp_uri)
-                    device.rtsp_endpoints.append(
-                        RTSPEndpoint(
-                            url=mask_rtsp_credentials(rtsp_uri),
-                            transport="tcp",
-                            port=parsed.port or 554,
-                            path=parsed.path or "/",
-                            profile_token="Profile_1",
-                            verified=True,
-                        )
-                    )
+            with opener.open(req, timeout=1.2) as resp:
+                raw_xml = resp.read(MAX_SOAP_RESPONSE_BYTES + 1)
+                if len(raw_xml) <= MAX_SOAP_RESPONSE_BYTES:
+                    rtsp_uri = self._extract_uri_from_soap(raw_xml)
+                    if rtsp_uri:
+                        parsed = urllib.parse.urlparse(rtsp_uri)
+                        clean_uri = sanitize_uri_template(mask_rtsp_credentials(rtsp_uri))
+                        device.rtsp_endpoints = [
+                            RTSPEndpoint(
+                                url=clean_uri,
+                                transport="tcp",
+                                port=parsed.port or 554,
+                                path=parsed.path or "/",
+                                profile_token="Profile_1",
+                                onvif_profile=(
+                                    device.onvif_profiles[0]
+                                    if device.onvif_profiles
+                                    else "Profile_T"
+                                ),
+                                verified=True,
+                            )
+                        ]
         except Exception as exc:
             logger.debug(
-                "ONVIF SOAP GetStreamUri fallback for %s (%s)",
+                "ONVIF SOAP GetStreamUri query for %s completed with fallback (%s)",
                 device.ip_address,
                 exc,
             )
 
-        # Ensure a standard ONVIF RTSP endpoint candidate is attached if SOAP didn't return one
-        if not device.rtsp_endpoints:
-            default_url = f"rtsp://{device.ip_address}:554/Streaming/Channels/101"
-            device.rtsp_endpoints.append(
-                RTSPEndpoint(
-                    url=default_url,
-                    transport="tcp",
-                    port=554,
-                    path="/Streaming/Channels/101",
-                    profile_token="Profile_1",
-                    verified=False,
-                )
-            )
-
     @staticmethod
     def _extract_uri_from_soap(xml_bytes: bytes) -> Optional[str]:
-        if not xml_bytes or b"<!DOCTYPE" in xml_bytes or b"<!ENTITY" in xml_bytes:
+        if (
+            not xml_bytes
+            or len(xml_bytes) > MAX_SOAP_RESPONSE_BYTES
+            or b"<!DOCTYPE" in xml_bytes
+            or b"<!ENTITY" in xml_bytes
+        ):
             return None
         try:
             root = ET.fromstring(xml_bytes)

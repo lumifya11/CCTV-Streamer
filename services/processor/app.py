@@ -14,7 +14,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, Field
 
 from services.processor.analytics_engine import VideoAnalyticsEngine
-from shared.config import get_config
+from shared.config import get_config, is_placeholder_secret
 from shared.logger import get_logger
 from shared.models import AnalyticsEvent, EventSeverity, EventType, HealthStatus
 from shared.security import verify_api_key
@@ -32,11 +32,13 @@ analytics_engine = VideoAnalyticsEngine(
     max_stored_events=config.max_stored_events,
 )
 
+MAX_FRAME_BASE64_LEN = 6_000_000  # ~4.5 MB upper bound on frame payload
+
 
 class FrameProcessRequest(BaseModel):
     camera_id: str
     camera_name: Optional[str] = None
-    image_base64: str = Field(..., description="Base64-encoded JPEG frame bytes")
+    image_base64: str = Field(..., max_length=MAX_FRAME_BASE64_LEN, description="Base64-encoded JPEG frame bytes")
 
 
 class CameraConfigUpdateRequest(BaseModel):
@@ -46,12 +48,13 @@ class CameraConfigUpdateRequest(BaseModel):
     tamper_variance_threshold: Optional[float] = Field(default=None, ge=0.5, le=255.0)
     event_cooldown_sec: Optional[float] = Field(default=None, ge=0.5, le=3600.0)
     enabled: Optional[bool] = None
+    zones: Optional[List[Dict[str, Any]]] = None
 
 
 async def _poll_transcoder_streams_task(stop_event: asyncio.Event) -> None:
     """Background worker that samples active camera snapshots from the Transcoder service."""
     headers: Dict[str, str] = {}
-    if config.api_secret_key and not config.api_secret_key.startswith("change-me"):
+    if not is_placeholder_secret(config.api_secret_key):
         headers["X-API-Key"] = config.api_secret_key
 
     async with httpx.AsyncClient(timeout=2.5, headers=headers) as client:
@@ -74,7 +77,6 @@ async def _poll_transcoder_streams_task(stop_event: asyncio.Event) -> None:
                                 jpeg_bytes=snap_resp.content,
                                 camera_name=cam_name,
                             )
-                            # Push motion status feedback back to transcoder OSD
                             await client.post(
                                 f"{config.transcoder_service_url}/api/v1/streams/{cam_id}/analytics",
                                 json={
@@ -114,8 +116,8 @@ async def lifespan(app: FastAPI):
 
 app = FastAPI(
     title="CCTV-Streamer Data Processing & Video Analytics Service",
-    description="OpenCV Real-Time Motion Detection, Contour Tracking & Tamper Analysis Microservice",
-    version="1.0.0",
+    description="OpenCV Real-Time Motion Detection, Zone Masking & Durable Event Persistence Service",
+    version="1.1.0",
     lifespan=lifespan,
 )
 
@@ -140,6 +142,7 @@ async def health_check() -> HealthStatus:
             "total_motion_events": summary["total_motion_events"],
             "total_tamper_events": summary["total_tamper_events"],
             "monitored_cameras": len(summary["cameras"]),
+            "durable_persistence": True,
         },
     )
 
@@ -192,6 +195,20 @@ async def list_analytics_events(
     )
 
 
+@app.post("/api/v1/events/{event_id}/acknowledge", response_model=AnalyticsEvent)
+async def acknowledge_event_endpoint(
+    event_id: str,
+    _: bool = Depends(verify_api_key),
+) -> AnalyticsEvent:
+    evt = analytics_engine.acknowledge_event(event_id)
+    if not evt:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail=f"Event '{event_id}' not found.",
+        )
+    return evt
+
+
 @app.get("/api/v1/metrics")
 async def get_analytics_metrics(_: bool = Depends(verify_api_key)) -> Dict[str, Any]:
     return analytics_engine.get_metrics_summary()
@@ -211,6 +228,7 @@ async def update_camera_analytics_config(
         tamper_variance_threshold=request.tamper_variance_threshold,
         event_cooldown_sec=request.event_cooldown_sec,
         enabled=request.enabled,
+        zones=request.zones,
     )
     return {
         "camera_id": cfg.camera_id,
@@ -220,15 +238,5 @@ async def update_camera_analytics_config(
         "tamper_variance_threshold": cfg.tamper_variance_threshold,
         "event_cooldown_sec": cfg.event_cooldown_sec,
         "enabled": cfg.enabled,
+        "zones": [z.__dict__ for z in cfg.zones],
     }
-
-
-if __name__ == "__main__":
-    import uvicorn
-
-    uvicorn.run(
-        "services.processor.app:app",
-        host=config.processor_host,
-        port=config.processor_port,
-        reload=False,
-    )

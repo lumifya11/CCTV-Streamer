@@ -1,38 +1,90 @@
-"""Shared enterprise utilities, configuration, security, and schemas for CCTV-Streamer."""
+"""Shared enterprise utilities, configuration, security, database, vault, and schemas for CCTV-Streamer."""
 
-from shared.config import AppConfig, get_config
+from shared.audit import list_audit_events, record_audit_event
+from shared.auth import (
+    authenticate_user,
+    bootstrap_owner_account,
+    create_signed_token,
+    hash_password,
+    issue_media_ticket,
+    verify_media_ticket,
+    verify_password,
+    verify_signed_token,
+)
+from shared.config import AppConfig, get_config, is_placeholder_secret
+from shared.database import DatabaseManager, get_db, reset_global_db
 from shared.logger import get_logger
 from shared.models import (
     AnalyticsEvent,
     CameraDevice,
+    CompatibilityTier,
+    DeliveryProtocol,
+    DeviceLifecycleState,
     DiscoveryRequest,
     DiscoveryResult,
     EventSeverity,
     EventType,
     HealthStatus,
+    RecordingMode,
     RTSPEndpoint,
     StreamMetrics,
     StreamRegistrationRequest,
     StreamState,
+    UserRole,
 )
-from shared.security import mask_rtsp_credentials, verify_api_key, validate_subnet_cidr
+from shared.secrets import CredentialVault
+from shared.security import (
+    mask_rtsp_credentials,
+    sanitize_uri_template,
+    validate_onvif_xaddr,
+    validate_rtsp_source,
+    validate_subnet_cidr,
+    validate_target_destination,
+    verify_api_key,
+    verify_media_access,
+)
 
 __all__ = [
     "AppConfig",
     "get_config",
+    "is_placeholder_secret",
     "get_logger",
+    "DatabaseManager",
+    "get_db",
+    "reset_global_db",
+    "CredentialVault",
+    "record_audit_event",
+    "list_audit_events",
+    "authenticate_user",
+    "bootstrap_owner_account",
+    "create_signed_token",
+    "hash_password",
+    "issue_media_ticket",
+    "verify_media_ticket",
+    "verify_password",
+    "verify_signed_token",
     "AnalyticsEvent",
     "CameraDevice",
+    "CompatibilityTier",
+    "DeliveryProtocol",
+    "DeviceLifecycleState",
     "DiscoveryRequest",
     "DiscoveryResult",
     "EventSeverity",
     "EventType",
     "HealthStatus",
+    "RecordingMode",
     "RTSPEndpoint",
     "StreamMetrics",
     "StreamRegistrationRequest",
     "StreamState",
+    "UserRole",
     "mask_rtsp_credentials",
-    "verify_api_key",
+    "sanitize_uri_template",
+    "validate_onvif_xaddr",
+    "validate_rtsp_source",
     "validate_subnet_cidr",
+    "validate_target_destination",
+    "verify_api_key",
+    "verify_media_access",
 ]

@@ -10,9 +10,9 @@
   const metricAggregateFps = document.getElementById("metric-aggregate-fps");
   const metricAggregateBitrate = document.getElementById("metric-aggregate-bitrate");
   const metricFramesAnalyzed = document.getElementById("metric-frames-analyzed");
-  const metricReconnections = document.getElementById("metric-reconnections");
   const metricMotionEvents = document.getElementById("metric-motion-events");
-  const metricTamperEvents = document.getElementById("metric-tamper-events");
+  const metricStorageFree = document.getElementById("metric-storage-free");
+  const metricStorageEstimate = document.getElementById("metric-storage-estimate");
 
   const renderedStreamIds = new Set();
 
@@ -25,7 +25,6 @@
   function renderStreams(streams) {
     const incomingIds = new Set(streams.map((s) => s.camera_id));
 
-    // Remove cards for deleted streams
     for (const existingId of Array.from(renderedStreamIds)) {
       if (!incomingIds.has(existingId)) {
         const el = document.getElementById(`card-${existingId}`);
@@ -36,6 +35,10 @@
 
     streams.forEach((stream) => {
       let card = document.getElementById(`card-${stream.camera_id}`);
+      const mjpegUrl = stream.mjpeg_ticket_url || `/api/v1/streams/${encodeURIComponent(stream.camera_id)}/mjpeg`;
+      const snapshotUrl = stream.snapshot_ticket_url || `/api/v1/streams/${encodeURIComponent(stream.camera_id)}/snapshot`;
+      const proto = stream.delivery_protocol || "MJPEG";
+
       if (!card) {
         card = document.createElement("article");
         card.className = "camera-card";
@@ -45,11 +48,12 @@
             <img
               class="camera-feed-img"
               id="feed-${escapeHtml(stream.camera_id)}"
-              src="/api/v1/streams/${encodeURIComponent(stream.camera_id)}/mjpeg"
+              src="${escapeHtml(mjpegUrl)}"
               alt="${escapeHtml(stream.name)} live stream"
             />
             <div class="viewport-badges">
               <span class="badge badge-live" id="state-${escapeHtml(stream.camera_id)}">${escapeHtml(stream.state)}</span>
+              <span class="badge">${escapeHtml(proto)}</span>
               <span class="badge" id="fps-${escapeHtml(stream.camera_id)}">${stream.fps_actual.toFixed(1)} FPS</span>
               <span class="badge badge-motion" id="motion-${escapeHtml(stream.camera_id)}" style="display:none;">MOTION</span>
             </div>
@@ -58,11 +62,11 @@
             <div>
               <div class="camera-meta-title">${escapeHtml(stream.name)}</div>
               <div class="camera-meta-sub" id="sub-${escapeHtml(stream.camera_id)}">
-                ${escapeHtml(stream.rtsp_url_masked)} &bull; ${stream.bitrate_kbps.toFixed(0)} kbps
+                ${escapeHtml(stream.location)} &bull; ${stream.bitrate_kbps.toFixed(0)} kbps &bull; Ticket Protected
               </div>
             </div>
             <div class="camera-actions">
-              <button type="button" class="btn btn-sm" data-action="snapshot" data-id="${escapeHtml(stream.camera_id)}">Snapshot</button>
+              <button type="button" class="btn btn-sm" data-action="snapshot" data-url="${escapeHtml(snapshotUrl)}" data-id="${escapeHtml(stream.camera_id)}">Snapshot</button>
               <button type="button" class="btn btn-sm" data-action="reconnect" data-id="${escapeHtml(stream.camera_id)}">Reconnect</button>
             </div>
           </div>
@@ -78,7 +82,7 @@
         if (stateEl) stateEl.textContent = stream.state;
         if (fpsEl) fpsEl.textContent = `${stream.fps_actual.toFixed(1)} FPS`;
         if (subEl) {
-          subEl.textContent = `${stream.rtsp_url_masked} • ${stream.bitrate_kbps.toFixed(0)} kbps • ${stream.frames_ingested} frames`;
+          subEl.textContent = `${stream.location} • ${stream.bitrate_kbps.toFixed(0)} kbps • ${stream.frames_ingested} frames`;
         }
         if (motionEl) {
           motionEl.style.display = stream.motion_active ? "inline-block" : "none";
@@ -90,21 +94,37 @@
 
   function renderDiscoveredCameras(cameras) {
     discoveredList.innerHTML = cameras
-      .map(
-        (cam) => `
-        <div class="discovered-item">
-          <div>
-            <div class="discovered-item-title">${escapeHtml(cam.name)}</div>
-            <div class="discovered-item-sub">
-              ${escapeHtml(cam.ip_address)} &bull; ${cam.onvif_supported ? "ONVIF" : "RTSP"} &bull; Ports: ${(cam.open_ports || []).join(",")}
+      .map((cam) => {
+        const stateBadge = cam.approved
+          ? `<span class="badge badge-live">${escapeHtml(cam.lifecycle_state)}</span>`
+          : `<button type="button" class="btn btn-sm btn-primary" data-approve-id="${escapeHtml(cam.camera_id)}">Approve</button>`;
+        const profileLabel = (cam.onvif_profiles || [])[0] || (cam.onvif_supported ? "ONVIF" : "RTSP");
+        return `
+          <div class="discovered-item">
+            <div>
+              <div class="discovered-item-title">${escapeHtml(cam.name)}</div>
+              <div class="discovered-item-sub">
+                ${escapeHtml(cam.ip_address)} &bull; ${escapeHtml(profileLabel)} &bull; ${escapeHtml(cam.compatibility_tier)}
+              </div>
             </div>
+            <div>${stateBadge}</div>
           </div>
-          <span class="badge">${cam.latency_ms.toFixed(1)} ms</span>
-        </div>
-      `
-      )
+        `;
+      })
       .join("");
   }
+
+  discoveredList.addEventListener("click", async (e) => {
+    const btn = e.target.closest("button[data-approve-id]");
+    if (!btn) return;
+    const candidateId = btn.dataset.approveId;
+    btn.disabled = true;
+    btn.textContent = "Approving...";
+    await fetch(`/api/v1/discovery/candidates/${encodeURIComponent(candidateId)}/approve`, {
+      method: "POST",
+    });
+    await refreshOverview();
+  });
 
   function renderEvents(events) {
     eventsCountBadge.textContent = `${events.length} EVENTS`;
@@ -116,10 +136,11 @@
       .slice(0, 20)
       .map((ev) => {
         const timeStr = new Date(ev.timestamp).toLocaleTimeString();
+        const ackLabel = ev.acknowledged ? "ACKED" : "NEW";
         return `
           <div class="event-item">
             <div class="event-item-top">
-              <span class="event-tag ${escapeHtml(ev.severity)}">${escapeHtml(ev.event_type)}</span>
+              <span class="event-tag ${escapeHtml(ev.severity)}">${escapeHtml(ev.event_type)} [${ackLabel}]</span>
               <span>${escapeHtml(timeStr)}</span>
             </div>
             <div class="event-desc">${escapeHtml(ev.description)}</div>
@@ -139,20 +160,27 @@
       const cameras = data.cameras || [];
       const events = data.events || [];
       const analytics = data.analytics || {};
+      const storage = data.storage || {};
 
       const activeCount = streams.filter((s) => s.state === "STREAMING").length;
+      const approvedCount = cameras.filter((c) => c.approved).length;
+      const candidateCount = cameras.length - approvedCount;
       const totalFps = streams.reduce((acc, s) => acc + (s.fps_actual || 0), 0);
       const totalBitrate = streams.reduce((acc, s) => acc + (s.bitrate_kbps || 0), 0);
-      const totalReconn = streams.reduce((acc, s) => acc + (s.total_reconnections || 0), 0);
 
       metricActiveStreams.textContent = `${activeCount} / ${streams.length}`;
-      metricTotalCameras.textContent = `${cameras.length} discovered ONVIF/RTSP devices`;
+      metricTotalCameras.textContent = `${approvedCount} approved • ${candidateCount} candidates`;
       metricAggregateFps.textContent = `${totalFps.toFixed(1)} FPS`;
       metricAggregateBitrate.textContent = `${totalBitrate.toFixed(0)} kbps transcoded`;
       metricFramesAnalyzed.textContent = `${analytics.total_frames_processed || 0}`;
-      metricReconnections.textContent = `${totalReconn} auto-reconnections`;
-      metricMotionEvents.textContent = `${analytics.total_motion_events || 0}`;
-      metricTamperEvents.textContent = `${analytics.total_tamper_events || 0} tamper alerts`;
+      metricMotionEvents.textContent = `${analytics.total_motion_events || 0} motion • ${analytics.total_tamper_events || 0} tamper`;
+
+      if (storage.disk_free_gb != null) {
+        metricStorageFree.textContent = `${storage.disk_free_gb.toFixed(1)} GB free`;
+      }
+      if (storage.capacity_estimate) {
+        metricStorageEstimate.textContent = `14d est: ${storage.capacity_estimate.estimated_gb} GB`;
+      }
 
       renderStreams(streams);
       renderDiscoveredCameras(cameras);
@@ -179,7 +207,8 @@
         refreshOverview();
       }, 450);
     } else if (action === "snapshot") {
-      window.open(`/api/v1/streams/${encodeURIComponent(cameraId)}/snapshot`, "_blank");
+      const snapUrl = btn.dataset.url || `/api/v1/streams/${encodeURIComponent(cameraId)}/snapshot`;
+      window.open(snapUrl, "_blank");
     }
   });
 
@@ -195,7 +224,7 @@
 
     scanBadge.textContent = "SCANNING...";
     try {
-      const resp = await fetch("/api/v1/discover", {
+      const resp = await fetch("/api/v1/discovery/jobs", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({
@@ -213,7 +242,7 @@
         scanBadge.textContent = `FOUND ${res.cameras.length} (${res.duration_ms.toFixed(0)}ms)`;
         await refreshOverview();
       } else {
-        scanBadge.textContent = "SCAN ERROR";
+        scanBadge.textContent = "SCOPE BLOCKED";
       }
     } catch (err) {
       scanBadge.textContent = "SCAN FAILED";
@@ -230,12 +259,36 @@
     matrixGrid.classList.add("single-view");
   });
 
-  const modal = document.getElementById("modal-add-stream");
+  const modalStream = document.getElementById("modal-add-stream");
   document.getElementById("btn-open-add-stream").addEventListener("click", () => {
-    modal.classList.add("open");
+    modalStream.classList.add("open");
   });
   document.getElementById("btn-close-add-stream").addEventListener("click", () => {
-    modal.classList.remove("open");
+    modalStream.classList.remove("open");
+  });
+
+  const modalMobile = document.getElementById("modal-mobile-pair");
+  document.getElementById("btn-open-mobile-pair").addEventListener("click", () => {
+    modalMobile.classList.add("open");
+  });
+  document.getElementById("btn-close-mobile-pair").addEventListener("click", () => {
+    modalMobile.classList.remove("open");
+  });
+
+  document.getElementById("btn-generate-pairing-code").addEventListener("click", async () => {
+    const resp = await fetch("/api/v1/mobile/pairing/start", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        device_label: "Flutter Android App",
+        server_url: window.location.origin,
+      }),
+    });
+    if (resp.ok) {
+      const data = await resp.json();
+      document.getElementById("mobile-pairing-code-display").textContent = data.pairing_code;
+      document.getElementById("mobile-pairing-qr-payload").textContent = `Server: ${data.server_url} (Expires in ${data.expires_in_sec}s)`;
+    }
   });
 
   document.getElementById("form-register-stream").addEventListener("submit", async (e) => {
@@ -256,7 +309,7 @@
       body: JSON.stringify(payload),
     });
     if (resp.ok) {
-      modal.classList.remove("open");
+      modalStream.classList.remove("open");
       e.target.reset();
       await refreshOverview();
     }

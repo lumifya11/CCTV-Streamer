@@ -2,139 +2,125 @@
 
 [![License: MIT](https://img.shields.io/badge/License-MIT-emerald.svg)](LICENSE)
 [![Python 3.11+](https://img.shields.io/badge/Python-3.11%2B-blue.svg)](pyproject.toml)
-[![OpenCV](https://img.shields.io/badge/Engine-OpenCV%204.x-green.svg)](services/transcoder/stream_engine.py)
-[![Docker Compose](https://img.shields.io/badge/Deploy-Docker%20Compose-2496ED.svg)](docker-compose.yml)
+[![MediaMTX](https://img.shields.io/badge/Media%20Plane-MediaMTX%20WebRTC%2FHLS-orange.svg)](media/mediamtx/mediamtx.yml)
+[![OpenCV](https://img.shields.io/badge/Analytics-OpenCV%204.x-green.svg)](services/processor/analytics_engine.py)
+[![Flutter](https://img.shields.io/badge/Mobile-Flutter%20Android-02569B.svg)](mobile/flutter_app/README.md)
 
-**CCTV-Streamer** is an enterprise-grade, self-hosted IP camera discovery, RTSP stream ingestion, low-latency transcoding, and real-time video analytics platform built on a modular Python microservices architecture.
+**CCTV-Streamer** is a self-hosted, local-first, multi-site capable video surveillance and authorized IoT management platform built on a modular Python microservices architecture.
+
+Full architectural specification: [`docs/architecture/ULTRA_MASTER_BLUEPRINT.md`](docs/architecture/ULTRA_MASTER_BLUEPRINT.md)  
+Security & authorization policy: [`SECURITY.md`](SECURITY.md)  
+Compatibility matrix: [`docs/compatibility/COMPATIBILITY_MATRIX.md`](docs/compatibility/COMPATIBILITY_MATRIX.md)
 
 ---
 
-## Architecture Overview
+## Non-Negotiable Authorization & Safety Boundaries
 
-The platform is decomposed into four decoupled microservices plus a shared core library, orchestrated via Docker Compose with strict resource quotas, container health checks, and credential-redacted structured logging.
+- **Owner-Approved Network Scopes Only**: Discovery runs exclusively against private network scopes (`NetworkScope`) created and approved by the system owner/administrator. Public internet scanning and third-party subnet sweeps are blocked.
+- **Strictly Non-Authenticating Discovery**: Network discovery (ONVIF WS-Discovery, TCP/RTSP `OPTIONS`, SSDP, ARP) never attempts default passwords, credential dictionaries, or authentication bypasses.
+- **Explicit Candidate Approval & Encrypted Vault**: Discovered hosts enter `CAMERA_CANDIDATE` state and cannot be enrolled or streamed until explicitly approved (`USER_APPROVED`). Camera credentials are encrypted at rest via `CredentialVault` (`VAULT_MASTER_KEY`) and are never returned in API responses or logs.
+- **Fail-Closed Authentication & Protected Media Plane**: Production mode fails closed if `API_SECRET_KEY` or `VAULT_MASTER_KEY` is missing or uses a `change-me` placeholder. All live streams, snapshots, WebSockets, WebRTC/HLS paths, and recordings require authentication or short-lived, camera-scoped playback tickets.
+- **Zero Paid Cloud APIs Required**: Runs 100% self-hosted on local hardware using open standards (ONVIF, RTSP, WebRTC, HLS, SQLite/PostgreSQL, Redis, MediaMTX, OpenCV, WireGuard).
+
+---
+
+## Target Architecture: Control, Media, Analytics & Site Planes
 
 ```mermaid
-flowchart LR
-    subgraph LAN["Local Camera Network (VLAN / Subnet)"]
-        CAM1["ONVIF IP Cameras\n(UDP 239.255.255.250:3702)"]
-        CAM2["RTSP Streams\n(TCP 554 / 8554)"]
-    end
+flowchart TB
+  subgraph SITE["Approved Camera LAN / Site"]
+    C1["ONVIF Profile T / RTSP IP Cameras"]
+    C2["Multi-Channel NVR / DVR"]
+    IOT["Authorized MQTT / IoT Sensors"]
+    AGENT["Optional CCTV-Streamer Site Agent"]
+    C1 --> AGENT
+    C2 --> AGENT
+    IOT --> AGENT
+  end
 
-    subgraph Microservices["CCTV-Streamer Containerized Microservices"]
-        DISC["Discovery Service (:8001)\nONVIF WS-Discovery + TCP/RTSP Scanner"]
-        TRANS["Transcoder Service (:8002)\nOpenCV RTSP Engine + Auto-Reconnect"]
-        PROC["Processor Service (:8003)\nOpenCV Motion & Tamper Analytics"]
-        REDIS[("Redis (:6379)\nTelemetry & State")]
-        GW["API Gateway & SOC Console (:8080)\nUnified REST / MJPEG / WebSocket"]
-    end
+  subgraph CORE["Self-Hosted CCTV-Streamer Server"]
+    DISC["Discovery Service (:8001)\nScoped Non-Authenticating Discovery"]
+    REG["Device Registry + Encrypted Credential Vault"]
+    GW["FastAPI Gateway / Auth / RBAC (:8080)"]
+    MEDIA["MediaMTX Media Server\nWebRTC (:8889) / HLS (:8888) / RTSP (:8554)"]
+    TRANS["Transcoder & Stream Controller (:8002)"]
+    PROC["OpenCV Analytics Processor (:8003)\nZones, Privacy Masks & Durable Events"]
+    DB[("SQLite / PostgreSQL\nDurable Registry, Events & Audit")]
+    REDIS[("Redis (:6379)\nEphemeral State")]
+    STORE[("Local / NAS Recording Storage")]
 
-    CAM1 <-->|"SOAP ProbeMatches &\nGetStreamUri"| DISC
-    CAM2 <-->|"TCP Handshake &\nRTSP OPTIONS"| DISC
-    CAM2 -->|"RTSP H.264/H.265\n(Low-Latency FFMPEG)"| TRANS
-    TRANS -->|"Frame Snapshots"| PROC
-    PROC -->|"Motion/OSD Feedback"| TRANS
+    DISC --> REG
+    REG --> DB
+    GW --> REG
+    GW --> DISC
+    GW --> TRANS
+    TRANS --> MEDIA
+    MEDIA --> STORE
+    MEDIA --> PROC
+    PROC --> DB
     PROC --> REDIS
-    DISC --> GW
-    TRANS -->|"Multipart MJPEG &\nWebSocket Frames"| GW
-    PROC -->|"Incident Events &\nTelemetry"| GW
+    GW --> MEDIA
+  end
+
+  AGENT == "mTLS / Authenticated Outbound Channel" ==> GW
+  WEB["Responsive Web Operations Console"] -->|"HTTPS / Ticket-Scoped Media"| GW
+  APP["Flutter Android Mobile App"] -->|"HTTPS / 120s Stream Tickets"| GW
+  WEB -->|"WebRTC / HLS"| MEDIA
+  APP -->|"WebRTC / HLS"| MEDIA
 ```
-
-### Microservices Breakdown
-
-| Service | Port | Source Directory | Core Responsibilities |
-| :--- | :--- | :--- | :--- |
-| **Discovery** | `8001` | [`services/discovery/`](services/discovery/) | Broadcasts ONVIF WS-Discovery UDP multicast probes (`239.255.255.250:3702`), resolves RTSP URIs via SOAP `GetStreamUri` with WS-UsernameToken Digest auth, and runs concurrent CIDR port scans (`554`, `8554`, `80`, `8000`, `8080`, `8899`) with RTSP `OPTIONS` protocol verification. |
-| **Transcoder** | `8002` | [`services/transcoder/`](services/transcoder/) | Ingests RTSP streams using OpenCV (`cv2.VideoCapture` + `CAP_FFMPEG`) with low-latency capture flags (`nobuffer`, `low_delay`), dedicated reader threads, exponential backoff + jitter reconnection, OSD telemetry overlays, and MJPEG / WebSocket delivery. |
-| **Processor** | `8003` | [`services/processor/`](services/processor/) | Executes real-time OpenCV frame analysis including Gaussian-smoothed differential motion detection, bounding-box contour extraction, lens obstruction/blackout tamper detection, and cooldown-deduplicated event logging. |
-| **Gateway & UI** | `8080` | [`services/gateway/`](services/gateway/) | Aggregates microservice APIs and serves the Enterprise Security Operations Center (SOC) Web Console for live 2&times;2 / 1&times;1 video matrix monitoring, on-demand network discovery, and incident review. |
-| **Shared Core** | — | [`shared/`](shared/) | Centralized `.env` configuration loader, Pydantic domain schemas, CIDR & SSRF validators, API key authentication dependency, and credential-redacting JSON logger. |
 
 ---
 
-## Key Capabilities
+## Compatibility Tiers
 
-### 1. Camera Discovery (`services/discovery/`)
-- **ONVIF WS-Discovery Multicast**: Sends standards-compliant SOAP `Probe` datagrams for `dn:NetworkVideoTransmitter` devices and parses `ProbeMatches` (`XAddrs`, hardware scopes, and locations) while defending against XML External Entity (XXE) injection.
-- **ONVIF SOAP Media Resolution**: Queries camera media endpoints using WS-Security `PasswordDigest` (`SHA-1(Nonce + Created + Password)`) to extract primary RTSP transport URIs.
-- **Concurrent Port & RTSP Handshake Scanner**: Multi-threaded subnet scanner (`ThreadPoolExecutor`) that probes candidate ports and issues `RTSP/1.0 OPTIONS` handshakes across vendor URI templates (Hikvision, Dahua, Axis, Reolink, Generic ONVIF).
+| Tier | Category | Details |
+| :--- | :--- | :--- |
+| **Tier 1** | **Standards-Based** | ONVIF **Profile T** (primary modern video/events/PTZ), legacy ONVIF **Profile S** (flagged as legacy; ONVIF support ends **31 March 2027**), optional **Profile G** (edge storage) and **Profile M** (analytics metadata). |
+| **Tier 2** | **Direct Stream** | Operator-supplied, authenticated `rtsp://`, `rtsps://`, `http://` MJPEG, or HLS streams. |
+| **Tier 3** | **Vendor & IoT Adapters** | Documented NVR/DVR channel mappers, local MQTT (`Mosquitto`) sensor telemetry, Home Assistant local entity bridge, and optional Frigate NVR event adapter ([`services/integrations/plugin_manager.py`](services/integrations/plugin_manager.py)). |
+| **Tier 4** | **Unsupported** | Proprietary cloud-locked P2P cameras without local ONVIF/RTSP or documented interfaces. Reported transparently as unsupported. |
 
-### 2. Resilient Stream Management (`services/transcoder/`)
-- **Low-Latency OpenCV Ingestion**: Configures `OPENCV_FFMPEG_CAPTURE_OPTIONS` (`rtsp_transport;tcp|fflags;nobuffer|flags;low_delay`) and minimal internal frame buffering to eliminate queue drift.
-- **Automatic Reconnection State Machine**: Tracks stream lifecycle states (`IDLE`, `CONNECTING`, `STREAMING`, `RECONNECTING`, `DEGRADED`, `OFFLINE`) and automatically recovers from socket drops or EOFs using exponential backoff with bounded jitter:
-  $$\text{delay} = \min\left(T_{\max},\; T_{\text{base}} \cdot 2^{\text{attempt}-1}\right) \pm \text{jitter}$$
-- **Web-Friendly Delivery**: Transcodes raw frames into low-latency `multipart/x-mixed-replace` MJPEG streams, binary WebSocket frame streams, and instant JPEG snapshots with live OSD telemetry.
+---
 
-### 3. Real-Time Data Processing (`services/processor/`)
-- **Kinetic Motion Detection**: Performs inter-frame Gaussian-blurred grayscale differencing, binary thresholding, morphological dilation, and contour area filtering to compute motion scores and object bounding boxes.
-- **Tamper & Obstruction Detection**: Evaluates frame luminance mean and pixel standard deviation (`cv2.meanStdDev`) to trigger `CRITICAL` alerts when a lens is covered, spray-painted, or experiences signal blackout.
+## Repository Structure
 
-### 4. System Stability, Configuration & Security
-- **Docker Resource Governance**: [`docker-compose.yml`](docker-compose.yml) enforces CPU and memory limits/reservations, `unless-stopped` restart policies, `no-new-privileges` security options, log rotation, and `service_healthy` startup ordering.
-- **Zero Hardcoded Secrets**: All credentials (`ONVIF_PASSWORD`, `RTSP_DEFAULT_PASSWORD`, `API_SECRET_KEY`, `REDIS_PASSWORD`) are injected via environment variables ([`.env.example`](.env.example)).
-- **Automatic Credential Redaction**: Embedded RTSP credentials (`rtsp://user:password@host:554/...`) and Bearer tokens are automatically masked (`rtsp://user:********@host:554/...`) across all API responses and log outputs.
+- [`shared/`](shared/) — Fail-closed config ([`config.py`](shared/config.py)), encrypted credential vault ([`secrets.py`](shared/secrets.py)), durable SQLite/PostgreSQL manager ([`database.py`](shared/database.py)), PBKDF2/JWT auth & short-lived media tickets ([`auth.py`](shared/auth.py)), SSRF/CIDR guards ([`security.py`](shared/security.py)), and audit trail ([`audit.py`](shared/audit.py)).
+- [`services/device_manager/`](services/device_manager/) — Durable Device Registry with immutable UUID identities and IP/MAC history ([`registry.py`](services/device_manager/registry.py)) and explicit enrollment workflow ([`enrollment.py`](services/device_manager/enrollment.py)).
+- [`services/discovery/`](services/discovery/) — Non-authenticating ONVIF WS-Discovery ([`onvif_scanner.py`](services/discovery/onvif_scanner.py)), scoped RTSP `OPTIONS` identifier ([`port_scanner.py`](services/discovery/port_scanner.py)), and ARP/SSDP enrichment ([`adapters/`](services/discovery/adapters/)).
+- [`services/transcoder/`](services/transcoder/) — Resilient OpenCV ingestion engine ([`stream_engine.py`](services/transcoder/stream_engine.py)) and MediaMTX WebRTC/HLS control adapter ([`mediamtx_client.py`](services/transcoder/mediamtx_client.py)).
+- [`services/processor/`](services/processor/) — OpenCV motion/tamper/scene-change analytics ([`analytics_engine.py`](services/processor/analytics_engine.py)) with detection & privacy mask zones ([`zones.py`](services/processor/zones.py)).
+- [`services/recording/`](services/recording/) — Segmented recording coordinator, SHA-256 indexer, retention manager, and storage capacity calculator ([`coordinator.py`](services/recording/coordinator.py)).
+- [`services/site_agent/`](services/site_agent/) — Multi-site outbound site agent manager ([`app.py`](services/site_agent/app.py)).
+- [`services/integrations/`](services/integrations/) — Plugin manager and NVR/IoT adapter interfaces ([`plugin_manager.py`](services/integrations/plugin_manager.py)).
+- [`services/gateway/`](services/gateway/) — Public ingress API Gateway ([`app.py`](services/gateway/app.py)) and web operations console ([`static/`](services/gateway/static/)).
+- [`mobile/flutter_app/`](mobile/flutter_app/) — Android-first Flutter mobile application with QR/code server pairing and ticket-scoped playback.
+- [`media/mediamtx/`](media/mediamtx/) — MediaMTX configuration with Gateway HTTP ticket authentication webhook ([`mediamtx.yml`](media/mediamtx/mediamtx.yml)).
 
 ---
 
 ## Quick Start
 
-### 1. Configure Environment Variables
+### 1. Environment Setup
 
 ```bash
 cp .env.example .env
-# Edit .env to set production secrets (API_SECRET_KEY, ONVIF_PASSWORD, REDIS_PASSWORD, etc.)
+# Generate strong production secrets for API_SECRET_KEY, VAULT_MASTER_KEY, and REDIS_PASSWORD
 ```
 
-### 2. Launch with Docker Compose (Recommended for Production)
+### 2. Run with Docker Compose (Secure Default Profile)
+
+Only the Gateway (`:8080`) and MediaMTX WebRTC/HLS ports are exposed to the trusted LAN; `discovery`, `transcoder`, `processor`, and `redis` remain isolated on the internal bridge network.
 
 ```bash
 docker compose up --build -d
-docker compose ps
 ```
 
-### 3. Run Locally for Development & Testing
+### 3. Run Locally & Execute Test Suite
 
 ```bash
 pip install -r requirements.txt
-
-# Run the unified Gateway & SOC Operations Console on port 8080:
-uvicorn services.gateway.app:app --host 0.0.0.0 --port 8080
-
-# Or run individual microservices separately:
-uvicorn services.discovery.app:app --host 0.0.0.0 --port 8001
-uvicorn services.transcoder.app:app --host 0.0.0.0 --port 8002
-uvicorn services.processor.app:app --host 0.0.0.0 --port 8003
-```
-
----
-
-## API Reference Summary
-
-### Discovery Service (`:8001` or via Gateway `:8080`)
-- `GET /health` — Service health and registered camera count.
-- `GET /api/v1/cameras` — List all discovered ONVIF and RTSP camera devices.
-- `POST /api/v1/discover` — Trigger an immediate ONVIF multicast + CIDR port scan.
-- `POST /api/v1/cameras/probe` — Probe a specific IP address and port list for RTSP endpoints.
-
-### Transcoder Service (`:8002` or via Gateway `:8080`)
-- `GET /api/v1/streams` — List all active OpenCV stream pipelines with FPS, bitrate, and reconnection counters.
-- `POST /api/v1/streams` — Register and start a new RTSP camera ingestion pipeline.
-- `POST /api/v1/streams/{camera_id}/reconnect` — Force an immediate stream reconnection cycle.
-- `GET /api/v1/streams/{camera_id}/mjpeg` — Low-latency multipart MJPEG video stream.
-- `GET /api/v1/streams/{camera_id}/snapshot` — Latest transcoded JPEG frame.
-- `WS /api/v1/streams/{camera_id}/ws` — Binary JPEG WebSocket stream.
-
-### Data Processor Service (`:8003` or via Gateway `:8080`)
-- `POST /api/v1/process/frame` — Analyze a base64-encoded JPEG frame for motion and tamper events.
-- `GET /api/v1/events` — Query detected motion and tamper events (`camera_id`, `event_type`, `severity`).
-- `GET /api/v1/metrics` — Per-camera and aggregate frame processing metrics.
-- `PUT /api/v1/config/{camera_id}` — Dynamically tune motion sensitivity, minimum contour area, and cooldowns.
-
----
-
-## Running Tests
-
-```bash
 pytest -v
+uvicorn services.gateway.app:app --host 0.0.0.0 --port 8080
 ```
 
 ---

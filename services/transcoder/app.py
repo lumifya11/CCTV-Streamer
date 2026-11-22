@@ -1,22 +1,39 @@
-"""FastAPI application for the Video Stream Transcoding Microservice."""
+"""FastAPI application for the Video Stream Transcoding & MediaMTX Control Microservice."""
 
 from __future__ import annotations
 
 import asyncio
 import time
 from contextlib import asynccontextmanager
-from typing import AsyncGenerator, List
+from typing import Any, AsyncGenerator, Dict, List, Optional
 
-from fastapi import Depends, FastAPI, HTTPException, Response, WebSocket, WebSocketDisconnect, status
+from fastapi import (
+    Depends,
+    FastAPI,
+    HTTPException,
+    Query,
+    Response,
+    WebSocket,
+    WebSocketDisconnect,
+    status,
+)
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import StreamingResponse
 from pydantic import BaseModel
 
+from services.device_manager.registry import DurableDeviceRegistry
+from services.transcoder.mediamtx_client import MediaMTXClient
 from services.transcoder.stream_engine import RTSPStreamWorker, StreamManager
-from shared.config import get_config
+from shared.auth import verify_media_ticket, verify_signed_token
+from shared.config import get_config, is_placeholder_secret
 from shared.logger import get_logger
-from shared.models import HealthStatus, StreamMetrics, StreamRegistrationRequest, StreamState
-from shared.security import verify_api_key
+from shared.models import (
+    HealthStatus,
+    StreamMetrics,
+    StreamRegistrationRequest,
+    StreamState,
+)
+from shared.security import verify_api_key, verify_media_access
 
 logger = get_logger("transcoder.service")
 SERVICE_START_TIME = time.monotonic()
@@ -30,6 +47,7 @@ stream_manager = StreamManager(
     reconnect_max_delay_sec=config.stream_reconnect_max_delay_sec,
     reconnect_max_attempts=config.stream_reconnect_max_attempts,
 )
+mediamtx_client = MediaMTXClient()
 
 
 class AnalyticsFeedbackPayload(BaseModel):
@@ -84,6 +102,7 @@ def _seed_demo_streams_if_enabled() -> None:
     ]
     for item in defaults:
         stream_manager.register_stream(item)
+        mediamtx_client.register_camera_path(item.camera_id, item.rtsp_url)
 
 
 @asynccontextmanager
@@ -100,9 +119,9 @@ async def lifespan(app: FastAPI):
 
 
 app = FastAPI(
-    title="CCTV-Streamer Video Transcoding Service",
-    description="Resilient OpenCV RTSP Ingestion & Low-Latency MJPEG/WebSocket Transcoding Service",
-    version="1.0.0",
+    title="CCTV-Streamer Video Transcoding & MediaMTX Control Service",
+    description="Resilient OpenCV RTSP Engine & MediaMTX WebRTC/HLS Stream Controller",
+    version="1.1.0",
     lifespan=lifespan,
 )
 
@@ -129,6 +148,7 @@ async def health_check() -> HealthStatus:
             "streaming_active": active_count,
             "reconnecting": reconnecting_count,
             "rtsp_transport": config.rtsp_transport,
+            "media_routes_protected": True,
         },
     )
 
@@ -139,6 +159,7 @@ async def list_streams(_: bool = Depends(verify_api_key)) -> List[StreamMetrics]
 
 
 @app.get("/api/v1/streams/{camera_id}", response_model=StreamMetrics)
+@app.get("/api/v1/streams/{camera_id}/status", response_model=StreamMetrics)
 async def get_stream_metrics(
     camera_id: str,
     _: bool = Depends(verify_api_key),
@@ -157,8 +178,18 @@ async def register_or_update_stream(
     request: StreamRegistrationRequest,
     _: bool = Depends(verify_api_key),
 ) -> StreamMetrics:
+    if request.require_approval:
+        reg = DurableDeviceRegistry()
+        dev = reg.get_device(request.camera_id)
+        if dev is not None and not dev.approved:
+            raise HTTPException(
+                status_code=status.HTTP_403_FORBIDDEN,
+                detail=f"Camera candidate '{request.camera_id}' must be approved before streaming.",
+            )
     try:
-        return stream_manager.register_stream(request)
+        metrics = stream_manager.register_stream(request)
+        mediamtx_client.register_camera_path(request.camera_id, request.rtsp_url)
+        return metrics
     except ValueError as exc:
         raise HTTPException(
             status_code=status.HTTP_400_BAD_REQUEST,
@@ -172,6 +203,7 @@ async def delete_stream(
     _: bool = Depends(verify_api_key),
 ) -> dict:
     removed = stream_manager.remove_stream(camera_id)
+    mediamtx_client.remove_camera_path(camera_id)
     if not removed:
         raise HTTPException(
             status_code=status.HTTP_404_NOT_FOUND,
@@ -195,6 +227,20 @@ async def reconnect_stream(
     return worker.get_metrics()
 
 
+@app.post("/api/v1/streams/{camera_id}/playback-ticket")
+async def create_stream_playback_ticket(
+    camera_id: str,
+    _: bool = Depends(verify_api_key),
+) -> Dict[str, Any]:
+    worker = stream_manager.get_worker(camera_id)
+    if not worker:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail=f"Stream pipeline '{camera_id}' not found.",
+        )
+    return mediamtx_client.build_playback_bundle(camera_id=camera_id)
+
+
 @app.post("/api/v1/streams/{camera_id}/analytics", response_model=StreamMetrics)
 async def update_stream_analytics_overlay(
     camera_id: str,
@@ -212,7 +258,10 @@ async def update_stream_analytics_overlay(
 
 
 @app.get("/api/v1/streams/{camera_id}/snapshot")
-async def get_stream_snapshot(camera_id: str) -> Response:
+async def get_stream_snapshot(
+    camera_id: str,
+    _auth: Dict[str, Any] = Depends(verify_media_access),
+) -> Response:
     worker = stream_manager.get_worker(camera_id)
     if not worker:
         raise HTTPException(
@@ -258,7 +307,10 @@ async def _mjpeg_stream_generator(worker: RTSPStreamWorker) -> AsyncGenerator[by
 
 
 @app.get("/api/v1/streams/{camera_id}/mjpeg")
-async def stream_mjpeg(camera_id: str) -> StreamingResponse:
+async def stream_mjpeg(
+    camera_id: str,
+    _auth: Dict[str, Any] = Depends(verify_media_access),
+) -> StreamingResponse:
     worker = stream_manager.get_worker(camera_id)
     if not worker:
         raise HTTPException(
@@ -277,8 +329,44 @@ async def stream_mjpeg(camera_id: str) -> StreamingResponse:
     )
 
 
+def _authorize_websocket(websocket: WebSocket, camera_id: str, ticket: Optional[str]) -> bool:
+    """Enforce fail-closed WebSocket authentication via ticket or headers."""
+    cfg = get_config()
+    must_fail_closed = cfg.is_production() or cfg.fail_closed_auth
+    expected_key = cfg.api_secret_key
+
+    if must_fail_closed and is_placeholder_secret(expected_key):
+        return False
+
+    if ticket:
+        return verify_media_ticket(ticket, required_camera_id=camera_id) is not None
+
+    auth_hdr = websocket.headers.get("authorization", "")
+    if auth_hdr.lower().startswith("bearer "):
+        tok = auth_hdr[7:].strip()
+        if verify_signed_token(tok) is not None:
+            return True
+        if not is_placeholder_secret(expected_key) and tok == expected_key:
+            return True
+
+    api_key_hdr = websocket.headers.get("x-api-key", "")
+    if api_key_hdr and not is_placeholder_secret(expected_key) and api_key_hdr == expected_key:
+        return True
+
+    if must_fail_closed or not is_placeholder_secret(expected_key):
+        return False
+    return True
+
+
 @app.websocket("/api/v1/streams/{camera_id}/ws")
-async def stream_websocket(websocket: WebSocket, camera_id: str) -> None:
+async def stream_websocket(
+    websocket: WebSocket,
+    camera_id: str,
+    ticket: Optional[str] = Query(default=None),
+) -> None:
+    if not _authorize_websocket(websocket, camera_id, ticket):
+        await websocket.close(code=1008)
+        return
     worker = stream_manager.get_worker(camera_id)
     if not worker:
         await websocket.close(code=1008)
@@ -299,14 +387,3 @@ async def stream_websocket(websocket: WebSocket, camera_id: str) -> None:
         return
     except Exception:
         return
-
-
-if __name__ == "__main__":
-    import uvicorn
-
-    uvicorn.run(
-        "services.transcoder.app:app",
-        host=config.transcoder_host,
-        port=config.transcoder_port,
-        reload=False,
-    )

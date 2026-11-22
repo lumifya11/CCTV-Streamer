@@ -41,18 +41,41 @@ def _parse_str_list(raw: str, default: List[str]) -> List[str]:
     return [item.strip() for item in raw.split(",") if item.strip()]
 
 
+def is_placeholder_secret(secret: str) -> bool:
+    """Return True if a secret is empty or uses an insecure placeholder prefix."""
+    clean = (secret or "").strip()
+    if not clean or len(clean) < 16:
+        return True
+    lower = clean.lower()
+    return (
+        lower.startswith("change-me")
+        or lower.startswith("placeholder")
+        or lower in ("secret", "password", "admin", "default")
+    )
+
+
 @dataclass(frozen=True)
 class AppConfig:
     """Immutable runtime configuration populated from environment variables."""
 
-    # Global & Security
-    environment: str = "production"
+    # Global, Deployment Profile & Security
+    environment: str = "development"
+    deployment_profile: str = "personal_lan"
     log_level: str = "INFO"
     log_format: str = "json"
     api_secret_key: str = ""
+    vault_master_key: str = ""
     internal_service_token: str = ""
     allowed_origins: List[str] = field(default_factory=lambda: ["http://localhost:8080"])
     allow_private_networks: bool = True
+    allow_loopback_in_tests: bool = True
+    fail_closed_auth: bool = True
+
+    # Storage & Database
+    database_url: str = "sqlite:///data/cctv_streamer.db"
+    recordings_dir: str = "recordings"
+    storage_budget_gb: float = 500.0
+    default_retention_days: int = 14
 
     # Discovery Microservice
     discovery_host: str = "0.0.0.0"
@@ -68,15 +91,19 @@ class AppConfig:
     onvif_multicast_port: int = 3702
     onvif_discovery_timeout_sec: float = 2.0
 
-    # Camera Credentials
-    onvif_username: str = "admin"
+    # Legacy env vars (never used during unauthenticated discovery; only for explicit CLI/test helpers)
+    onvif_username: str = ""
     onvif_password: str = ""
-    rtsp_default_username: str = "admin"
+    rtsp_default_username: str = ""
     rtsp_default_password: str = ""
 
-    # Transcoder Microservice
+    # Transcoder & MediaMTX Media Plane
     transcoder_host: str = "0.0.0.0"
     transcoder_port: int = 8002
+    mediamtx_api_url: str = "http://mediamtx:9997"
+    mediamtx_webrtc_url: str = "http://localhost:8889"
+    mediamtx_hls_url: str = "http://localhost:8888"
+    mediamtx_rtsp_url: str = "rtsp://localhost:8554"
     rtsp_transport: str = "tcp"
     stream_target_fps: int = 20
     stream_jpeg_quality: int = 80
@@ -87,7 +114,7 @@ class AppConfig:
     stream_reconnect_base_delay_sec: float = 1.0
     stream_reconnect_max_delay_sec: float = 30.0
     stream_reconnect_max_attempts: int = 0
-    enable_demo_streams: bool = True
+    enable_demo_streams: bool = False
 
     # Processor Microservice
     processor_host: str = "0.0.0.0"
@@ -108,16 +135,51 @@ class AppConfig:
     processor_service_url: str = "http://localhost:8003"
     redis_url: str = "redis://localhost:6379/0"
 
+    def is_production(self) -> bool:
+        return self.environment.lower() == "production"
+
+    def validate_production_readiness(self) -> List[str]:
+        """Return a list of configuration security violations for production mode."""
+        violations: List[str] = []
+        if self.is_production():
+            if is_placeholder_secret(self.api_secret_key):
+                violations.append(
+                    "API_SECRET_KEY must be set to a strong non-placeholder secret in production."
+                )
+            if is_placeholder_secret(self.vault_master_key):
+                violations.append(
+                    "VAULT_MASTER_KEY must be set to a strong non-placeholder key in production."
+                )
+            if self.enable_demo_streams and self.deployment_profile != "demo":
+                violations.append(
+                    "ENABLE_DEMO_STREAMS cannot be enabled in production unless DEPLOYMENT_PROFILE=demo."
+                )
+        return violations
+
 
 def get_config(env_file: str = ".env") -> AppConfig:
     """Load configuration from environment variables (with .env fallback)."""
     _load_dotenv_if_present(env_file)
 
+    environment = os.getenv("ENVIRONMENT", "development").strip().lower()
+    deployment_profile = os.getenv("DEPLOYMENT_PROFILE", "personal_lan").strip().lower()
+
+    # Demo streams are opt-in and forcibly disabled in production unless DEPLOYMENT_PROFILE=demo
+    raw_demo = os.getenv("ENABLE_DEMO_STREAMS", "")
+    if environment == "production" and deployment_profile != "demo":
+        enable_demo_streams = False
+    elif raw_demo:
+        enable_demo_streams = raw_demo.lower() in ("1", "true", "yes")
+    else:
+        enable_demo_streams = environment in ("development", "test", "demo")
+
     return AppConfig(
-        environment=os.getenv("ENVIRONMENT", "production"),
+        environment=environment,
+        deployment_profile=deployment_profile,
         log_level=os.getenv("LOG_LEVEL", "INFO").upper(),
         log_format=os.getenv("LOG_FORMAT", "json").lower(),
         api_secret_key=os.getenv("API_SECRET_KEY", ""),
+        vault_master_key=os.getenv("VAULT_MASTER_KEY", ""),
         internal_service_token=os.getenv("INTERNAL_SERVICE_TOKEN", ""),
         allowed_origins=_parse_str_list(
             os.getenv("ALLOWED_ORIGINS", ""),
@@ -125,6 +187,17 @@ def get_config(env_file: str = ".env") -> AppConfig:
         ),
         allow_private_networks=os.getenv("ALLOW_PRIVATE_NETWORKS", "true").lower()
         in ("1", "true", "yes"),
+        allow_loopback_in_tests=os.getenv("ALLOW_LOOPBACK_IN_TESTS", "true").lower()
+        in ("1", "true", "yes"),
+        fail_closed_auth=os.getenv(
+            "FAIL_CLOSED_AUTH",
+            "true" if environment == "production" else "false",
+        ).lower()
+        in ("1", "true", "yes"),
+        database_url=os.getenv("DATABASE_URL", "sqlite:///data/cctv_streamer.db"),
+        recordings_dir=os.getenv("RECORDINGS_DIR", "recordings"),
+        storage_budget_gb=float(os.getenv("STORAGE_BUDGET_GB", "500.0")),
+        default_retention_days=int(os.getenv("DEFAULT_RETENTION_DAYS", "14")),
         discovery_host=os.getenv("DISCOVERY_HOST", "0.0.0.0"),
         discovery_port=int(os.getenv("DISCOVERY_PORT", "8001")),
         discovery_subnets=_parse_str_list(
@@ -145,12 +218,16 @@ def get_config(env_file: str = ".env") -> AppConfig:
         onvif_discovery_timeout_sec=float(
             os.getenv("ONVIF_DISCOVERY_TIMEOUT_SEC", "2.0")
         ),
-        onvif_username=os.getenv("ONVIF_USERNAME", "admin"),
+        onvif_username=os.getenv("ONVIF_USERNAME", ""),
         onvif_password=os.getenv("ONVIF_PASSWORD", ""),
-        rtsp_default_username=os.getenv("RTSP_DEFAULT_USERNAME", "admin"),
+        rtsp_default_username=os.getenv("RTSP_DEFAULT_USERNAME", ""),
         rtsp_default_password=os.getenv("RTSP_DEFAULT_PASSWORD", ""),
         transcoder_host=os.getenv("TRANSCODER_HOST", "0.0.0.0"),
         transcoder_port=int(os.getenv("TRANSCODER_PORT", "8002")),
+        mediamtx_api_url=os.getenv("MEDIAMTX_API_URL", "http://mediamtx:9997").rstrip("/"),
+        mediamtx_webrtc_url=os.getenv("MEDIAMTX_WEBRTC_URL", "http://localhost:8889").rstrip("/"),
+        mediamtx_hls_url=os.getenv("MEDIAMTX_HLS_URL", "http://localhost:8888").rstrip("/"),
+        mediamtx_rtsp_url=os.getenv("MEDIAMTX_RTSP_URL", "rtsp://localhost:8554").rstrip("/"),
         rtsp_transport=os.getenv("RTSP_TRANSPORT", "tcp").lower(),
         stream_target_fps=max(1, min(60, int(os.getenv("STREAM_TARGET_FPS", "20")))),
         stream_jpeg_quality=max(
@@ -169,8 +246,7 @@ def get_config(env_file: str = ".env") -> AppConfig:
         stream_reconnect_max_attempts=int(
             os.getenv("STREAM_RECONNECT_MAX_ATTEMPTS", "0")
         ),
-        enable_demo_streams=os.getenv("ENABLE_DEMO_STREAMS", "true").lower()
-        in ("1", "true", "yes"),
+        enable_demo_streams=enable_demo_streams,
         processor_host=os.getenv("PROCESSOR_HOST", "0.0.0.0"),
         processor_port=int(os.getenv("PROCESSOR_PORT", "8003")),
         processor_sample_interval_sec=float(

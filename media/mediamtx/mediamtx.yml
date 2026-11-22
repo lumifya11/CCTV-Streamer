@@ -1,0 +1,58 @@
+# =============================================================================
+# CCTV-Streamer MediaMTX Configuration (Primary Media Plane)
+# Supports RTSP ingest/restream, WebRTC low-latency, HLS fallback,
+# fMP4 segmented recording, and ticket-authenticated access via Gateway.
+# =============================================================================
+
+logLevel: info
+logDestinations: [stdout]
+
+# Private Control API (Internal Docker network only - never publish to host)
+api: yes
+apiAddress: :9997
+
+# Metrics (Internal network only)
+metrics: yes
+metricsAddress: :9998
+
+# External HTTP Authentication Callback to Gateway Ticket Verifier
+authMethod: http
+authHTTPAddress: http://gateway:8080/api/v1/streams/mediamtx-auth
+authHTTPExclude:
+  - action: api
+  - action: metrics
+
+# RTSP Server (Trusted internal / LAN transport)
+rtsp: yes
+protocols: [tcp]
+rtspAddress: :8554
+
+# WebRTC Server (Primary low-latency browser & Flutter Android delivery)
+webrtc: yes
+webrtcAddress: :8889
+webrtcAllowOrigin: '*'
+webrtcLocalUDPAddress: :8189
+
+# HLS Server (Compatibility fallback for constrained networks)
+hls: yes
+hlsAddress: :8888
+hlsVariant: lowLatency
+hlsSegmentCount: 7
+hlsSegmentDuration: 1s
+hlsPartDuration: 200ms
+
+# Recording Playback Server
+playback: yes
+playbackAddress: :9996
+
+# Default Path Template (Dynamic camera paths registered by Transcoder controller)
+pathDefaults:
+  source: publisher
+  record: no
+  recordPath: /recordings/%path/%Y-%m-%d_%H-%M-%S-%f
+  recordFormat: fmp4
+  recordPartDuration: 1s
+  recordSegmentDuration: 5m
+  recordDeleteAfter: 14d
+
+paths: {}

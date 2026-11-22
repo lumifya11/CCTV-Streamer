@@ -35,6 +35,38 @@ services:
         max-size: "10m"
         max-file: "3"
 
+  mediamtx:
+    image: bluenviron/mediamtx:latest
+    container_name: cctv-mediamtx
+    restart: unless-stopped
+    volumes:
+      - ./media/mediamtx/mediamtx.yml:/mediamtx.yml:ro
+      - recordings_data:/recordings
+    expose:
+      - "9997"
+      - "8554"
+    ports:
+      - "${MEDIAMTX_WEBRTC_PORT:-8889}:8889"
+      - "${MEDIAMTX_WEBRTC_UDP_PORT:-8189}:8189/udp"
+      - "${MEDIAMTX_HLS_PORT:-8888}:8888"
+    networks:
+      - cctv_internal
+    security_opt:
+      - no-new-privileges:true
+    deploy:
+      resources:
+        limits:
+          cpus: "1.50"
+          memory: 1024M
+        reservations:
+          cpus: "0.25"
+          memory: 256M
+    logging:
+      driver: "json-file"
+      options:
+        max-size: "25m"
+        max-file: "3"
+
   discovery:
     build:
       context: .
@@ -45,19 +77,21 @@ services:
       - .env
     environment:
       - ENVIRONMENT=${ENVIRONMENT:-production}
+      - DEPLOYMENT_PROFILE=${DEPLOYMENT_PROFILE:-personal_lan}
       - LOG_LEVEL=${LOG_LEVEL:-INFO}
       - LOG_FORMAT=${LOG_FORMAT:-json}
       - API_SECRET_KEY=${API_SECRET_KEY}
+      - VAULT_MASTER_KEY=${VAULT_MASTER_KEY}
+      - DATABASE_URL=sqlite:////data/cctv_streamer.db
       - DISCOVERY_HOST=0.0.0.0
       - DISCOVERY_PORT=8001
       - DISCOVERY_SUBNETS=${DISCOVERY_SUBNETS:-192.168.1.0/24}
       - DISCOVERY_PORTS=${DISCOVERY_PORTS:-554,8554,80,8000,8080,8899}
-      - ONVIF_USERNAME=${ONVIF_USERNAME:-admin}
-      - ONVIF_PASSWORD=${ONVIF_PASSWORD}
-      - RTSP_DEFAULT_USERNAME=${RTSP_DEFAULT_USERNAME:-admin}
-      - RTSP_DEFAULT_PASSWORD=${RTSP_DEFAULT_PASSWORD}
-    ports:
-      - "${DISCOVERY_PORT:-8001}:8001"
+      - ENABLE_DEMO_STREAMS=${ENABLE_DEMO_STREAMS:-false}
+    volumes:
+      - cctv_db_data:/data
+    expose:
+      - "8001"
     networks:
       - cctv_internal
     security_opt:
@@ -92,21 +126,27 @@ services:
       - .env
     environment:
       - ENVIRONMENT=${ENVIRONMENT:-production}
+      - DEPLOYMENT_PROFILE=${DEPLOYMENT_PROFILE:-personal_lan}
       - LOG_LEVEL=${LOG_LEVEL:-INFO}
       - LOG_FORMAT=${LOG_FORMAT:-json}
       - API_SECRET_KEY=${API_SECRET_KEY}
+      - VAULT_MASTER_KEY=${VAULT_MASTER_KEY}
+      - DATABASE_URL=sqlite:////data/cctv_streamer.db
       - TRANSCODER_HOST=0.0.0.0
       - TRANSCODER_PORT=8002
+      - MEDIAMTX_API_URL=http://mediamtx:9997
       - RTSP_TRANSPORT=${RTSP_TRANSPORT:-tcp}
       - STREAM_TARGET_FPS=${STREAM_TARGET_FPS:-20}
       - STREAM_JPEG_QUALITY=${STREAM_JPEG_QUALITY:-80}
       - STREAM_FRAME_WIDTH=${STREAM_FRAME_WIDTH:-1280}
       - STREAM_FRAME_HEIGHT=${STREAM_FRAME_HEIGHT:-720}
       - STREAM_BUFFER_SIZE=${STREAM_BUFFER_SIZE:-2}
-      - STREAM_RECONNECT_BASE_DELAY_SEC=${STREAM_RECONNECT_BASE_DELAY_SEC:-1.0}
-      - STREAM_RECONNECT_MAX_DELAY_SEC=${STREAM_RECONNECT_MAX_DELAY_SEC:-30.0}
-    ports:
-      - "${TRANSCODER_PORT:-8002}:8002"
+      - ENABLE_DEMO_STREAMS=${ENABLE_DEMO_STREAMS:-false}
+    volumes:
+      - cctv_db_data:/data
+      - recordings_data:/recordings
+    expose:
+      - "8002"
     networks:
       - cctv_internal
     security_opt:
@@ -146,17 +186,22 @@ services:
       - .env
     environment:
       - ENVIRONMENT=${ENVIRONMENT:-production}
+      - DEPLOYMENT_PROFILE=${DEPLOYMENT_PROFILE:-personal_lan}
       - LOG_LEVEL=${LOG_LEVEL:-INFO}
       - LOG_FORMAT=${LOG_FORMAT:-json}
       - API_SECRET_KEY=${API_SECRET_KEY}
+      - VAULT_MASTER_KEY=${VAULT_MASTER_KEY}
+      - DATABASE_URL=sqlite:////data/cctv_streamer.db
       - PROCESSOR_HOST=0.0.0.0
       - PROCESSOR_PORT=8003
       - TRANSCODER_SERVICE_URL=http://transcoder:8002
       - REDIS_URL=redis://:${REDIS_PASSWORD}@redis:6379/0
       - MOTION_SENSITIVITY_THRESHOLD=${MOTION_SENSITIVITY_THRESHOLD:-500.0}
       - MOTION_MIN_CONTOUR_AREA=${MOTION_MIN_CONTOUR_AREA:-450}
-    ports:
-      - "${PROCESSOR_PORT:-8003}:8003"
+    volumes:
+      - cctv_db_data:/data
+    expose:
+      - "8003"
     networks:
       - cctv_internal
     security_opt:
@@ -198,15 +243,23 @@ services:
       - .env
     environment:
       - ENVIRONMENT=${ENVIRONMENT:-production}
+      - DEPLOYMENT_PROFILE=${DEPLOYMENT_PROFILE:-personal_lan}
       - LOG_LEVEL=${LOG_LEVEL:-INFO}
       - LOG_FORMAT=${LOG_FORMAT:-json}
       - GATEWAY_MODE=distributed
       - GATEWAY_HOST=0.0.0.0
       - GATEWAY_PORT=8080
       - API_SECRET_KEY=${API_SECRET_KEY}
+      - VAULT_MASTER_KEY=${VAULT_MASTER_KEY}
+      - DATABASE_URL=sqlite:////data/cctv_streamer.db
+      - RECORDINGS_DIR=/recordings
       - DISCOVERY_SERVICE_URL=http://discovery:8001
       - TRANSCODER_SERVICE_URL=http://transcoder:8002
       - PROCESSOR_SERVICE_URL=http://processor:8003
+      - MEDIAMTX_API_URL=http://mediamtx:9997
+    volumes:
+      - cctv_db_data:/data
+      - recordings_data:/recordings
     ports:
       - "${GATEWAY_PORT:-8080}:8080"
     networks:
@@ -239,3 +292,5 @@ networks:
 
 volumes:
   redis_data:
+  cctv_db_data:
+  recordings_data:

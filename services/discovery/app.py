@@ -1,8 +1,8 @@
-"""FastAPI application for the Camera Discovery Microservice."""
+"""FastAPI application for the Scoped, Non-Authenticating Camera Discovery Microservice."""
 
 from __future__ import annotations
 
-import hashlib
+import json
 import threading
 import time
 import uuid
@@ -13,51 +13,64 @@ from fastapi import Depends, FastAPI, HTTPException, Query, status
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, Field
 
+from services.device_manager.registry import DurableDeviceRegistry
+from services.discovery.adapters import discover_ssdp_camera_candidates, read_local_arp_table
 from services.discovery.onvif_scanner import OnvifProbeDevice, OnvifScanner
-from services.discovery.port_scanner import HostScanResult, NetworkPortScanner, probe_tcp_port, verify_rtsp_endpoint
+from services.discovery.port_scanner import (
+    HostScanResult,
+    NetworkPortScanner,
+    probe_tcp_port,
+    verify_rtsp_endpoint,
+)
+from shared.audit import record_audit_event
 from shared.config import AppConfig, get_config
+from shared.database import DatabaseManager, get_db
 from shared.logger import get_logger
 from shared.models import (
     CameraDevice,
+    CompatibilityTier,
+    DeviceLifecycleState,
     DiscoveryRequest,
     DiscoveryResult,
     HealthStatus,
     RTSPEndpoint,
     utc_now_iso,
 )
-from shared.security import mask_rtsp_credentials, validate_subnet_cidr, verify_api_key
+from shared.security import (
+    sanitize_uri_template,
+    validate_subnet_cidr,
+    verify_api_key,
+)
 
 logger = get_logger("discovery.service")
 SERVICE_START_TIME = time.monotonic()
 
 
 class DirectCameraProbeRequest(BaseModel):
-    ip_address: str = Field(..., description="Target IPv4 address to probe")
+    ip_address: str = Field(..., description="Target authorized IPv4 address to probe")
+    site_id: str = Field(default="site-default")
     ports: List[int] = Field(default_factory=lambda: [554, 8554, 80, 8000, 8080])
-    username: Optional[str] = None
-    password: Optional[str] = None
     timeout_sec: float = Field(default=1.0, ge=0.2, le=5.0)
 
 
-def _camera_id_for_ip(ip_address: str) -> str:
-    digest = hashlib.sha256(ip_address.encode("utf-8")).hexdigest()[:10]
-    return f"cam-{digest}"
-
-
 class CameraDiscoveryRegistry:
-    """Thread-safe registry managing discovered ONVIF and RTSP camera devices."""
+    """
+    Coordinates non-authenticating ONVIF WS-Discovery and scoped TCP/RTSP discovery,
+    persisting all candidates in the DurableDeviceRegistry (`shared/database.py`).
+    """
 
-    def __init__(self, config: AppConfig) -> None:
+    def __init__(self, config: AppConfig, db: Optional[DatabaseManager] = None) -> None:
         self.config = config
+        self.db = db or get_db()
+        self.durable_registry = DurableDeviceRegistry(db=self.db)
         self._lock = threading.RLock()
-        self._cameras: Dict[str, CameraDevice] = {}
         self._last_scan_result: Optional[DiscoveryResult] = None
 
         if self.config.enable_demo_streams:
             self._seed_default_enterprise_cameras()
 
     def _seed_default_enterprise_cameras(self) -> None:
-        """Seed default synthetic/demo ONVIF cameras so the platform operates out-of-the-box."""
+        """Seed demo ONVIF cameras only when ENABLE_DEMO_STREAMS is explicitly active."""
         presets = [
             (
                 "cam-north-gate",
@@ -96,63 +109,99 @@ class CameraDiscoveryRegistry:
                 "demo://lobby-main",
             ),
         ]
-        with self._lock:
-            for cam_id, name, ip, vendor, model, loc, url in presets:
-                self._cameras[cam_id] = CameraDevice(
-                    camera_id=cam_id,
-                    name=name,
-                    ip_address=ip,
-                    open_ports=[554, 80, 8000],
-                    onvif_supported=True,
-                    onvif_xaddr=f"http://{ip}:80/onvif/device_service",
-                    manufacturer=vendor,
-                    model=model,
-                    firmware_version="v5.8.12-enterprise",
-                    location=loc,
-                    rtsp_endpoints=[
-                        RTSPEndpoint(
-                            url=url,
-                            transport="tcp",
-                            port=554,
-                            path="/Streaming/Channels/101",
-                            profile_token="MainStream_1080p",
-                            resolution="1280x720",
-                            codec="H.264",
-                            verified=True,
-                        )
-                    ],
-                    primary_rtsp_url=url,
-                    latency_ms=2.4,
-                    discovered_via=["onvif", "port_scan"],
-                    online=True,
-                )
+        for cam_id, name, ip, vendor, model, loc, url in presets:
+            cam = CameraDevice(
+                camera_id=cam_id,
+                site_id="site-default",
+                scope_id="scope-default-lan",
+                name=name,
+                ip_address=ip,
+                open_ports=[554, 80, 8000],
+                onvif_supported=True,
+                onvif_xaddr=f"http://{ip}:80/onvif/device_service",
+                onvif_profiles=["Profile_T", "Profile_G", "Profile_M"],
+                compatibility_tier=CompatibilityTier.TIER_1_STANDARDS,
+                lifecycle_state=DeviceLifecycleState.ONLINE,
+                confidence=0.98,
+                manufacturer=vendor,
+                model=model,
+                firmware_version="v5.8.12-enterprise",
+                location=loc,
+                rtsp_endpoints=[
+                    RTSPEndpoint(
+                        url=url,
+                        transport="tcp",
+                        port=554,
+                        path="/Streaming/Channels/101",
+                        profile_token="MainStream_1080p",
+                        onvif_profile="Profile_T",
+                        resolution="1280x720",
+                        codec="H.264",
+                        verified=True,
+                    )
+                ],
+                primary_rtsp_url=url,
+                approved=True,
+                approved_by="demo-profile",
+                latency_ms=2.4,
+                discovered_via=["onvif", "port_scan"],
+                online=True,
+            )
+            self.durable_registry.upsert_discovered_device(cam)
 
-    def list_cameras(self) -> List[CameraDevice]:
-        with self._lock:
-            return list(self._cameras.values())
+    def list_cameras(
+        self,
+        site_id: Optional[str] = None,
+        approved_only: bool = False,
+        candidates_only: bool = False,
+    ) -> List[CameraDevice]:
+        return self.durable_registry.list_devices(
+            site_id=site_id,
+            approved_only=approved_only,
+            candidates_only=candidates_only,
+        )
 
     def get_camera(self, camera_id: str) -> Optional[CameraDevice]:
-        with self._lock:
-            return self._cameras.get(camera_id)
+        return self.durable_registry.get_device(camera_id)
 
     def upsert_camera(self, camera: CameraDevice) -> CameraDevice:
-        with self._lock:
-            self._cameras[camera.camera_id] = camera
-            return camera
+        return self.durable_registry.upsert_discovered_device(camera)
 
     def execute_discovery(self, req: DiscoveryRequest) -> DiscoveryResult:
-        """Run combined ONVIF WS-Discovery and concurrent TCP/RTSP port scanning."""
+        """
+        Run scope-bound, non-authenticating ONVIF WS-Discovery and TCP/RTSP service identification.
+        Never sends default or saved credentials during discovery.
+        """
         scan_id = f"scan-{uuid.uuid4().hex[:10]}"
         started_at = utc_now_iso()
         t0 = time.monotonic()
 
-        subnets = req.subnets if req.subnets is not None else self.config.discovery_subnets
+        subnets = (
+            req.subnets
+            if req.subnets is not None
+            else (
+                self.durable_registry.get_approved_cidrs(site_id=req.site_id)
+                or self.config.discovery_subnets
+            )
+        )
         ports = req.ports if req.ports is not None else self.config.discovery_ports
 
-        # Validate all requested CIDR blocks before scanning
+        # Enforce private/approved CIDR validation before probing any host
         for subnet in subnets:
-            if "/" in subnet:
-                validate_subnet_cidr(subnet, max_hosts=1024)
+            cidr_to_check = f"{subnet}/32" if "/" not in subnet else subnet
+            validate_subnet_cidr(cidr_to_check, max_hosts=1024, allow_public=False)
+
+        self.db.execute(
+            """
+            INSERT INTO discovery_jobs (
+                job_id, site_id, scope_ids_json, status, started_at
+            )
+            VALUES (?, ?, ?, 'RUNNING', ?)
+            """,
+            (scan_id, req.site_id, json.dumps([req.scope_id or "scope-default-lan"]), started_at),
+        )
+
+        arp_map = read_local_arp_table()
 
         onvif_devices: List[OnvifProbeDevice] = []
         if req.enable_onvif_multicast:
@@ -160,10 +209,9 @@ class CameraDiscoveryRegistry:
                 multicast_host=self.config.onvif_multicast_host,
                 multicast_port=self.config.onvif_multicast_port,
                 timeout_sec=min(req.timeout_sec, self.config.onvif_discovery_timeout_sec),
-                username=self.config.onvif_username,
-                password=self.config.onvif_password,
             )
-            onvif_devices = onvif_scanner.discover_multicast()
+            # Non-authenticating multicast probe only (`enrich_via_soap=False`)
+            onvif_devices = onvif_scanner.discover_multicast(enrich_via_soap=False)
 
         port_scan_results: List[HostScanResult] = []
         if req.enable_port_scan and subnets:
@@ -171,67 +219,89 @@ class CameraDiscoveryRegistry:
                 ports=ports,
                 timeout_sec=req.timeout_sec,
                 max_workers=self.config.discovery_max_workers,
-                rtsp_username=self.config.rtsp_default_username,
-                rtsp_password=self.config.rtsp_default_password,
             )
             port_scan_results = port_scanner.scan_subnets(
                 subnets=subnets,
                 verify_rtsp=req.verify_rtsp_endpoints,
             )
 
-        merged_by_ip: Dict[str, CameraDevice] = {}
+        ssdp_candidates = (
+            discover_ssdp_camera_candidates(timeout_sec=0.5)
+            if req.enable_ssdp
+            else []
+        )
+
+        merged_by_ip: Dict[str, Tuple[CameraDevice, Optional[str], Dict[str, str]]] = {}
 
         for odev in onvif_devices:
-            cam_id = _camera_id_for_ip(odev.ip_address)
             primary_url = (
                 odev.rtsp_endpoints[0].url
                 if odev.rtsp_endpoints
                 else f"rtsp://{odev.ip_address}:554/Streaming/Channels/101"
             )
-            merged_by_ip[odev.ip_address] = CameraDevice(
-                camera_id=cam_id,
+            cam = CameraDevice(
+                camera_id=f"dev-{uuid.uuid4().hex[:12]}",
+                site_id=req.site_id,
+                scope_id=req.scope_id,
                 name=f"{odev.manufacturer} {odev.model} ({odev.ip_address})",
                 ip_address=odev.ip_address,
+                mac_address=arp_map.get(odev.ip_address),
                 open_ports=[554, 80],
                 onvif_supported=True,
                 onvif_xaddr=odev.xaddr,
+                onvif_profiles=odev.onvif_profiles,
+                legacy_profile_s=odev.legacy_profile_s,
+                compatibility_tier=CompatibilityTier.TIER_1_STANDARDS,
+                lifecycle_state=DeviceLifecycleState.CAMERA_CANDIDATE,
+                confidence=0.90,
                 manufacturer=odev.manufacturer,
                 model=odev.model,
                 firmware_version=odev.firmware_version,
                 serial_number=odev.serial_number,
                 location=odev.location,
                 rtsp_endpoints=odev.rtsp_endpoints,
-                primary_rtsp_url=mask_rtsp_credentials(primary_url),
+                primary_rtsp_url=sanitize_uri_template(primary_url),
+                approved=False,
                 latency_ms=odev.response_time_ms,
                 discovered_via=["onvif"],
                 online=True,
+            )
+            merged_by_ip[odev.ip_address] = (
+                cam,
+                odev.endpoint_reference or None,
+                {"method": "onvif_ws_discovery", "xaddr": odev.xaddr},
             )
 
         for host_res in port_scan_results:
             ip = host_res.ip_address
             if ip in merged_by_ip:
-                existing = merged_by_ip[ip]
-                combined_ports = sorted(set(existing.open_ports + host_res.open_ports))
-                existing.open_ports = combined_ports
+                existing, epr, ev = merged_by_ip[ip]
+                existing.open_ports = sorted(set(existing.open_ports + host_res.open_ports))
                 if "port_scan" not in existing.discovered_via:
                     existing.discovered_via.append("port_scan")
                 existing_urls = {ep.url for ep in existing.rtsp_endpoints}
                 for ep in host_res.rtsp_endpoints:
                     if ep.url not in existing_urls:
                         existing.rtsp_endpoints.append(ep)
-                if not existing.primary_rtsp_url and existing.rtsp_endpoints:
-                    existing.primary_rtsp_url = existing.rtsp_endpoints[0].url
             else:
-                cam_id = _camera_id_for_ip(ip)
                 primary_url = (
                     host_res.rtsp_endpoints[0].url
                     if host_res.rtsp_endpoints
                     else f"rtsp://{ip}:554/stream1"
                 )
-                merged_by_ip[ip] = CameraDevice(
-                    camera_id=cam_id,
-                    name=f"{host_res.manufacturer_hint} Camera ({ip})",
+                lifecycle = (
+                    DeviceLifecycleState.CAMERA_CANDIDATE
+                    if host_res.rtsp_service_detected or host_res.onvif_http_port
+                    else DeviceLifecycleState.SERVICE_DETECTED
+                )
+                confidence = 0.78 if host_res.rtsp_service_detected else 0.55
+                cam = CameraDevice(
+                    camera_id=f"dev-{uuid.uuid4().hex[:12]}",
+                    site_id=req.site_id,
+                    scope_id=req.scope_id,
+                    name=f"{host_res.manufacturer_hint} Candidate ({ip})",
                     ip_address=ip,
+                    mac_address=arp_map.get(ip),
                     open_ports=host_res.open_ports,
                     onvif_supported=(host_res.onvif_http_port is not None),
                     onvif_xaddr=(
@@ -239,48 +309,99 @@ class CameraDiscoveryRegistry:
                         if host_res.onvif_http_port
                         else None
                     ),
+                    compatibility_tier=CompatibilityTier.TIER_2_DIRECT_STREAM,
+                    lifecycle_state=lifecycle,
+                    confidence=confidence,
                     manufacturer=host_res.manufacturer_hint,
-                    model="RTSP Network Camera",
-                    location="Discovered Subnet",
+                    model="RTSP Network Candidate",
+                    location="Discovered Scope",
                     rtsp_endpoints=host_res.rtsp_endpoints,
-                    primary_rtsp_url=mask_rtsp_credentials(primary_url),
+                    primary_rtsp_url=sanitize_uri_template(primary_url),
+                    approved=False,
                     latency_ms=host_res.latency_ms,
                     discovered_via=["port_scan"],
                     online=True,
                 )
+                merged_by_ip[ip] = (
+                    cam,
+                    None,
+                    {"method": "unauthenticated_rtsp_probe", "ports": str(host_res.open_ports)},
+                )
 
-        with self._lock:
-            for cam in merged_by_ip.values():
-                self._cameras[cam.camera_id] = cam
-            all_cameras = (
-                list(merged_by_ip.values())
-                if merged_by_ip or not req.include_simulated_if_empty
-                else list(self._cameras.values())
+        for ssdp_item in ssdp_candidates:
+            ip = ssdp_item["ip_address"]
+            if ip in merged_by_ip:
+                cam, _, _ = merged_by_ip[ip]
+                if "ssdp" not in cam.discovered_via:
+                    cam.discovered_via.append("ssdp")
+
+        persisted_cameras: List[CameraDevice] = []
+        for cam, epr, evidence in merged_by_ip.values():
+            saved = self.durable_registry.upsert_discovered_device(
+                cam, onvif_uuid=epr, evidence=evidence
             )
+            persisted_cameras.append(saved)
+
+        if not persisted_cameras and req.include_simulated_if_empty and self.config.enable_demo_streams:
+            persisted_cameras = self.list_cameras(site_id=req.site_id)
 
         duration_ms = round((time.monotonic() - t0) * 1000.0, 2)
+        completed_at = utc_now_iso()
+
+        self.db.execute(
+            """
+            UPDATE discovery_jobs
+            SET status = 'COMPLETED',
+                completed_at = ?,
+                hosts_checked = ?,
+                candidates_found = ?,
+                summary_json = ?
+            WHERE job_id = ?
+            """,
+            (
+                completed_at,
+                len(port_scan_results) + len(onvif_devices),
+                len(persisted_cameras),
+                json.dumps(
+                    {
+                        "duration_ms": duration_ms,
+                        "onvif_found": len(onvif_devices),
+                        "port_scan_found": len(port_scan_results),
+                    }
+                ),
+                scan_id,
+            ),
+        )
+        record_audit_event(
+            action="DISCOVERY_JOB_COMPLETED",
+            target_type="DISCOVERY_JOB",
+            target_id=scan_id,
+            actor="discovery-service",
+            actor_role="SYSTEM",
+            details={
+                "site_id": req.site_id,
+                "subnets": subnets,
+                "candidates_found": len(persisted_cameras),
+                "unauthenticated": True,
+            },
+            db=self.db,
+        )
+
         result = DiscoveryResult(
             scan_id=scan_id,
+            site_id=req.site_id,
             started_at=started_at,
-            completed_at=utc_now_iso(),
+            completed_at=completed_at,
             duration_ms=duration_ms,
             subnets_scanned=subnets,
             ports_probed=ports,
             onvif_devices_found=len(onvif_devices),
             port_scan_hosts_found=len(port_scan_results),
-            cameras=all_cameras,
+            unauthenticated_scan=True,
+            cameras=persisted_cameras,
         )
         with self._lock:
             self._last_scan_result = result
-
-        logger.info(
-            "Discovery scan %s completed in %.1f ms (ONVIF=%d, PortScan=%d, Total=%d)",
-            scan_id,
-            duration_ms,
-            len(onvif_devices),
-            len(port_scan_results),
-            len(all_cameras),
-        )
         return result
 
 
@@ -291,7 +412,7 @@ registry = CameraDiscoveryRegistry(config)
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     logger.info(
-        "Starting Camera Discovery Microservice on %s:%d",
+        "Starting Scoped Camera Discovery Microservice on %s:%d",
         config.discovery_host,
         config.discovery_port,
     )
@@ -301,8 +422,8 @@ async def lifespan(app: FastAPI):
 
 app = FastAPI(
     title="CCTV-Streamer Camera Discovery Service",
-    description="Enterprise ONVIF WS-Discovery & Concurrent RTSP Port Scanning Microservice",
-    version="1.0.0",
+    description="Scoped, Non-Authenticating ONVIF WS-Discovery & RTSP Candidate Discovery Service",
+    version="1.1.0",
     lifespan=lifespan,
 )
 
@@ -322,9 +443,9 @@ async def health_check() -> HealthStatus:
         status="healthy",
         uptime_seconds=round(time.monotonic() - SERVICE_START_TIME, 2),
         details={
-            "registered_cameras": len(registry.list_cameras()),
+            "registered_devices": len(registry.list_cameras()),
             "configured_subnets": config.discovery_subnets,
-            "configured_ports": config.discovery_ports,
+            "unauthenticated_discovery_enforced": True,
         },
     )
 
@@ -332,12 +453,21 @@ async def health_check() -> HealthStatus:
 @app.get("/api/v1/cameras", response_model=List[CameraDevice])
 async def list_discovered_cameras(
     online_only: bool = Query(default=False),
+    approved_only: bool = Query(default=False),
     _: bool = Depends(verify_api_key),
 ) -> List[CameraDevice]:
-    cameras = registry.list_cameras()
+    cameras = registry.list_cameras(approved_only=approved_only)
     if online_only:
         cameras = [c for c in cameras if c.online]
     return cameras
+
+
+@app.get("/api/v1/discovery/candidates", response_model=List[CameraDevice])
+async def list_discovery_candidates(
+    site_id: Optional[str] = Query(default=None),
+    _: bool = Depends(verify_api_key),
+) -> List[CameraDevice]:
+    return registry.list_cameras(site_id=site_id, candidates_only=True)
 
 
 @app.get("/api/v1/cameras/{camera_id}", response_model=CameraDevice)
@@ -355,6 +485,7 @@ async def get_camera_details(
 
 
 @app.post("/api/v1/discover", response_model=DiscoveryResult)
+@app.post("/api/v1/discovery/jobs", response_model=DiscoveryResult)
 async def trigger_network_discovery(
     request: DiscoveryRequest = DiscoveryRequest(),
     _: bool = Depends(verify_api_key),
@@ -373,9 +504,12 @@ async def probe_single_camera(
     request: DirectCameraProbeRequest,
     _: bool = Depends(verify_api_key),
 ) -> CameraDevice:
-    """Directly probe a single IP address for open RTSP/ONVIF ports and register it."""
+    """
+    Directly probe a single IP within an approved private subnet for open RTSP/ONVIF ports.
+    Strictly unauthenticated: registers the device as an unapproved candidate.
+    """
     try:
-        validate_subnet_cidr(f"{request.ip_address}/32")
+        validate_subnet_cidr(f"{request.ip_address}/32", allow_public=False)
     except ValueError as exc:
         raise HTTPException(
             status_code=status.HTTP_400_BAD_REQUEST,
@@ -392,12 +526,12 @@ async def probe_single_camera(
 
     endpoints: List[RTSPEndpoint] = []
     for port in (p for p in open_ports if p in (554, 8554)):
-        valid, _, code = verify_rtsp_endpoint(
+        verify_rtsp_endpoint(
             ip_address=request.ip_address,
             port=port,
             path="/Streaming/Channels/101",
-            username=request.username or config.rtsp_default_username,
-            password=request.password or config.rtsp_default_password,
+            username=None,
+            password=None,
             timeout_sec=request.timeout_sec,
         )
         endpoints.append(
@@ -406,7 +540,7 @@ async def probe_single_camera(
                 transport="tcp",
                 port=port,
                 path="/Streaming/Channels/101",
-                verified=(valid and code == "200"),
+                verified=False,
             )
         )
 
@@ -421,29 +555,20 @@ async def probe_single_camera(
             )
         )
 
-    cam_id = _camera_id_for_ip(request.ip_address)
     device = CameraDevice(
-        camera_id=cam_id,
-        name=f"Probed Camera ({request.ip_address})",
+        camera_id=f"dev-{uuid.uuid4().hex[:12]}",
+        site_id=request.site_id,
+        name=f"Probed Candidate ({request.ip_address})",
         ip_address=request.ip_address,
         open_ports=open_ports,
         onvif_supported=any(p in (80, 8000, 8080, 8899) for p in open_ports),
+        compatibility_tier=CompatibilityTier.TIER_2_DIRECT_STREAM,
+        lifecycle_state=DeviceLifecycleState.CAMERA_CANDIDATE,
         primary_rtsp_url=endpoints[0].url,
         rtsp_endpoints=endpoints,
+        approved=False,
         latency_ms=round(sum(latencies) / len(latencies), 2) if latencies else 0.0,
         discovered_via=["direct_probe"],
         online=bool(open_ports),
     )
-    registry.upsert_camera(device)
-    return device
-
-
-if __name__ == "__main__":
-    import uvicorn
-
-    uvicorn.run(
-        "services.discovery.app:app",
-        host=config.discovery_host,
-        port=config.discovery_port,
-        reload=False,
-    )
+    return registry.upsert_camera(device)
