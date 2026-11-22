@@ -1,0 +1,159 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>CCTV-Streamer | Enterprise Surveillance &amp; RTSP Microservices Console</title>
+  <meta name="description" content="Enterprise self-hosted CCTV monitoring system with ONVIF camera discovery, OpenCV RTSP stream ingestion, and real-time video analytics." />
+  <link rel="preconnect" href="https://fonts.googleapis.com" />
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
+  <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&family=JetBrains+Mono:wght@400;500;600&display=swap" rel="stylesheet" />
+  <link rel="stylesheet" href="/static/styles.css" />
+</head>
+<body>
+  <header class="topbar">
+    <div class="brand-group">
+      <div class="brand-mark" aria-hidden="true">
+        <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+          <path d="M23 7l-7 5 7 5V7z"></path>
+          <rect x="1" y="5" width="15" height="14" rx="2" ry="2"></rect>
+        </svg>
+      </div>
+      <div class="brand-title">
+        <h1>CCTV-Streamer Operations Console</h1>
+        <div class="brand-subtitle">ONVIF Discovery &bull; OpenCV RTSP Transcoder &bull; Real-Time Analytics</div>
+      </div>
+    </div>
+
+    <div class="service-strip" id="service-health-strip">
+      <span class="service-pill" id="pill-discovery">
+        <span class="status-dot"></span> Discovery: ONLINE
+      </span>
+      <span class="service-pill" id="pill-transcoder">
+        <span class="status-dot"></span> Transcoder: ONLINE
+      </span>
+      <span class="service-pill" id="pill-processor">
+        <span class="status-dot"></span> Analytics: ONLINE
+      </span>
+    </div>
+
+    <div class="topbar-actions">
+      <button type="button" class="btn" id="btn-open-add-stream">Add RTSP Stream</button>
+      <button type="button" class="btn btn-primary" id="btn-trigger-scan">Run ONVIF / Port Scan</button>
+    </div>
+  </header>
+
+  <main class="workspace">
+    <section aria-label="Live Surveillance Matrix">
+      <div class="metrics-bar">
+        <div class="metric-tile">
+          <div class="metric-label">Active RTSP Pipelines</div>
+          <div class="metric-value" id="metric-active-streams">0</div>
+          <div class="metric-meta" id="metric-total-cameras">0 discovered endpoints</div>
+        </div>
+        <div class="metric-tile">
+          <div class="metric-label">Aggregate Frame Rate</div>
+          <div class="metric-value" id="metric-aggregate-fps">0.0 FPS</div>
+          <div class="metric-meta" id="metric-aggregate-bitrate">0.0 kbps transcoded</div>
+        </div>
+        <div class="metric-tile">
+          <div class="metric-label">OpenCV Frames Analyzed</div>
+          <div class="metric-value" id="metric-frames-analyzed">0</div>
+          <div class="metric-meta" id="metric-reconnections">0 stream reconnections</div>
+        </div>
+        <div class="metric-tile">
+          <div class="metric-label">Kinetic Motion Alerts</div>
+          <div class="metric-value" id="metric-motion-events">0</div>
+          <div class="metric-meta" id="metric-tamper-events">0 tamper alerts</div>
+        </div>
+      </div>
+
+      <div class="section-header">
+        <h2 class="section-title">Live OpenCV Transcoded Stream Matrix (MJPEG Low-Latency)</h2>
+        <div class="layout-controls">
+          <button type="button" class="btn btn-sm" id="btn-grid-2x2">2&times;2 Matrix</button>
+          <button type="button" class="btn btn-sm" id="btn-grid-1x1">Single Focus</button>
+        </div>
+      </div>
+
+      <div class="camera-grid" id="camera-matrix-grid"></div>
+    </section>
+
+    <aside class="sidebar" aria-label="Discovery and Analytics Telemetry">
+      <div class="panel">
+        <div class="panel-header">
+          <h2 class="panel-title">ONVIF &amp; Subnet Port Scanner</h2>
+          <span class="badge" id="scan-status-badge">READY</span>
+        </div>
+        <form id="discovery-scan-form" class="form-stack">
+          <div class="field-group">
+            <label for="input-scan-subnets">Target IPv4 CIDR / Host IP</label>
+            <input
+              type="text"
+              id="input-scan-subnets"
+              class="input-text"
+              value="127.0.0.1/32"
+              placeholder="e.g. 192.168.1.0/24"
+            />
+          </div>
+          <div class="field-group">
+            <label for="input-scan-ports">RTSP &amp; ONVIF TCP Ports</label>
+            <input
+              type="text"
+              id="input-scan-ports"
+              class="input-text"
+              value="554,8554,80,8000,8080"
+            />
+          </div>
+          <button type="submit" class="btn btn-primary" id="btn-submit-scan">
+            Scan Network &amp; Verify RTSP
+          </button>
+        </form>
+
+        <div class="discovered-list" id="discovered-cameras-list"></div>
+      </div>
+
+      <div class="panel">
+        <div class="panel-header">
+          <h2 class="panel-title">OpenCV Analytics Event Log</h2>
+          <span class="badge" id="events-count-badge">0 EVENTS</span>
+        </div>
+        <div class="event-list" id="analytics-events-list"></div>
+      </div>
+    </aside>
+  </main>
+
+  <!-- Add Stream Modal -->
+  <div class="modal-backdrop" id="modal-add-stream" role="dialog" aria-modal="true" aria-labelledby="modal-add-stream-title">
+    <div class="modal-box">
+      <div class="panel-header">
+        <h2 class="panel-title" id="modal-add-stream-title">Register RTSP Camera Stream</h2>
+        <button type="button" class="btn btn-sm" id="btn-close-add-stream">Close</button>
+      </div>
+      <form id="form-register-stream" class="form-stack">
+        <div class="field-group">
+          <label for="reg-camera-id">Camera Identifier</label>
+          <input type="text" id="reg-camera-id" class="input-text" placeholder="cam-east-wing" required />
+        </div>
+        <div class="field-group">
+          <label for="reg-camera-name">Camera Label</label>
+          <input type="text" id="reg-camera-name" class="input-text" placeholder="East Wing Entrance" required />
+        </div>
+        <div class="field-group">
+          <label for="reg-camera-location">Facility Zone</label>
+          <input type="text" id="reg-camera-location" class="input-text" value="Sector B" required />
+        </div>
+        <div class="field-group">
+          <label for="reg-rtsp-url">RTSP Endpoint URI (or demo://name)</label>
+          <input type="text" id="reg-rtsp-url" class="input-text" placeholder="rtsp://192.168.1.50:554/Streaming/Channels/101" required />
+        </div>
+        <button type="submit" class="btn btn-primary" id="btn-submit-register-stream">
+          Start OpenCV Ingestion Pipeline
+        </button>
+      </form>
+    </div>
+  </div>
+
+  <script src="/static/app.js"></script>
+</body>
+</html>

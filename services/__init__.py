@@ -1,0 +1,1 @@
+"""Camera Discovery Microservice package."""

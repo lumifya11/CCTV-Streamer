@@ -221,3 +221,21 @@ __marimo__/
 
 # Streamlit
 .streamlit/secrets.toml
+
+# CCTV-Streamer media, recordings, and runtime data
+*.mp4
+*.avi
+*.mkv
+*.m3u8
+*.ts
+*.jpg
+*.jpeg
+recordings/
+snapshots/
+hls_segments/
+data/*.db
+data/*.sqlite*
+.env.*
+!.env.example
+docker-compose.override.yml
+
